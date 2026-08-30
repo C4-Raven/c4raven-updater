@@ -1,0 +1,570 @@
+diff -ruN '--exclude=__pycache__' '--exclude=*.bak-*' a/opentakserver/app.py b/opentakserver/app.py
+--- a/opentakserver/app.py	2026-08-30 20:16:47.790769037 +1000
++++ b/opentakserver/app.py	2026-08-30 14:20:00.266875599 +1000
+@@ -39,6 +39,7 @@
+ from opentakserver.controllers.meshtastic_controller import MeshtasticController
+ from opentakserver.defaultconfig import DefaultConfig
+ from opentakserver.EmailValidator import EmailValidator
++from opentakserver.forms.SiteAccessLoginForm import SiteAccessLoginForm
+ from opentakserver.extensions import apscheduler, babel, db, ldap_manager, logger, mail, socketio
+ from opentakserver.models.Group import Group, GroupTypeEnum
+ from opentakserver.models.Icon import Icon
+@@ -193,6 +194,7 @@
+         mail_util_cls=EmailValidator,
+         password_util_cls=PasswordValidator,
+         username_util_cls=UsernameValidator,
++        login_form=SiteAccessLoginForm,
+     )
+ 
+     mail.init_app(app)
+@@ -288,6 +290,93 @@
+ 
+         init_extensions(app)
+ 
++        # CUSTOM: force_password_change patch -- new users (see user_api.create_user)
++        # are created with force_password_change=True. The Login page (see
++        # OpenTAKServer-UI src/pages/Login/Login.tsx) reads a force_password_change
++        # field on the login/tf-validate success response and shows an inline
++        # "set a new password" step when it's true, instead of navigating to the
++        # dashboard. Everything else stays hard-blocked server-side regardless of
++        # what the frontend does, as the actual enforcement boundary.
++        _force_pw_change_url = app.config.get("SECURITY_URL_PREFIX", "") + app.config.get(
++            "SECURITY_CHANGE_URL", "/password/change"
++        )
++        _force_pw_logout_url = app.config.get("SECURITY_URL_PREFIX", "") + app.config.get(
++            "SECURITY_LOGOUT_URL", "/logout"
++        )
++        _login_url = app.config.get("SECURITY_URL_PREFIX", "") + app.config.get(
++            "SECURITY_LOGIN_URL", "/login"
++        )
++        _tf_validate_url = app.config.get("SECURITY_URL_PREFIX", "") + app.config.get(
++            "SECURITY_TWO_FACTOR_TOKEN_VALIDATION_URL", "/tf-validate"
++        )
++
++        @app.after_request
++        def _force_password_change_hook(response):
++            import json as _json
++
++            from flask import request as _req
++            from flask_security import current_user as _current_user
++
++            path = _req.path
++
++            # Unconditional exemption: login/tf-validate/change-password/logout
++            # must never be blocked, regardless of what current_user resolves to.
++            # In particular, if the browser still carries a session cookie for a
++            # DIFFERENT, previously-logged-in flagged account (e.g. switching
++            # accounts without logging out first), current_user reflects that
++            # OLD identity until this request's own login_user() call replaces
++            # it -- which for an account requiring 2FA doesn't happen until
++            # tf-validate succeeds. Blocking here would wrongly refuse a brand
++            # new login attempt because of an unrelated stale session.
++            if path in (_login_url, _tf_validate_url, _force_pw_change_url, _force_pw_logout_url):
++                if path in (_login_url, _tf_validate_url) and response.status_code == 200 and response.is_json:
++                    try:
++                        if _current_user.is_authenticated:
++                            data = response.get_json()
++                            data.setdefault("response", {})["force_password_change"] = bool(
++                                getattr(_current_user, "force_password_change", False)
++                            )
++                            response.set_data(_json.dumps(data))
++                    except Exception:
++                        pass
++                return response
++
++            try:
++                authenticated = _current_user.is_authenticated
++            except Exception:
++                authenticated = False
++
++            flagged = authenticated and getattr(_current_user, "force_password_change", False)
++            if not flagged:
++                return response
++
++            response.set_data(
++                _json.dumps(
++                    {
++                        "meta": {"code": 403},
++                        "response": {
++                            "errors": [
++                                "You must change your password before continuing. "
++                                "Go to " + _force_pw_change_url + " to set a new one, "
++                                "then log in again."
++                            ]
++                        },
++                    }
++                )
++            )
++            response.status_code = 403
++            response.mimetype = "application/json"
++            return response
++
++        from flask_security.signals import password_changed as _password_changed_signal
++
++        @_password_changed_signal.connect_via(app)
++        def _clear_force_password_change(sender, user, **extra):
++            if getattr(user, "force_password_change", False):
++                user.force_password_change = False
++                db.session.add(user)
++                db.session.commit()
++
+         from opentakserver.blueprints.marti_api import marti_blueprint
+ 
+         app.register_blueprint(marti_blueprint)
+@@ -336,6 +425,7 @@
+             mail_util_cls=EmailValidator,
+             password_util_cls=PasswordValidator,
+             username_util_cls=UsernameValidator,
++            login_form=SiteAccessLoginForm,
+         )
+ 
+         # Register blueprints to properly import all the DB models without circular imports
+diff -ruN '--exclude=__pycache__' '--exclude=*.bak-*' a/opentakserver/blueprints/ots_api/api.py b/opentakserver/blueprints/ots_api/api.py
+--- a/opentakserver/blueprints/ots_api/api.py	2026-08-30 20:16:47.795050315 +1000
++++ b/opentakserver/blueprints/ots_api/api.py	2026-08-30 19:29:40.752818855 +1000
+@@ -236,6 +236,14 @@
+         "percent": disk_usage.percent,
+     }
+ 
++    net_io = psutil.net_io_counters()
++    network_dict = {
++        "bytes_sent": net_io.bytes_sent,
++        "bytes_recv": net_io.bytes_recv,
++        "packets_sent": net_io.packets_sent,
++        "packets_recv": net_io.packets_recv,
++    }
++
+     try:
+         os_release = platform.freedesktop_os_release()
+     except:
+@@ -262,6 +270,7 @@
+         "load_avg": psutil.getloadavg(),
+         "memory": vmem_dict,
+         "disk_usage": disk_usage_dict,
++        "network": network_dict,
+         "ots_version": version,
+         "uname": uname,
+         "os_release": os_release,
+diff -ruN '--exclude=__pycache__' '--exclude=*.bak-*' a/opentakserver/blueprints/ots_api/user_api.py b/opentakserver/blueprints/ots_api/user_api.py
+--- a/opentakserver/blueprints/ots_api/user_api.py	2026-08-30 20:16:47.797656963 +1000
++++ b/opentakserver/blueprints/ots_api/user_api.py	2026-08-30 15:06:57.366020096 +1000
+@@ -1,3 +1,5 @@
++import secrets
++import string
+ import traceback
+ 
+ import bleach
+@@ -88,7 +90,12 @@
+     if not app.security.datastore.find_user(username=username):
+         logger.info("Creating user {}".format(username))
+         app.security.datastore.create_user(
+-            username=username, password=hash_password(password), roles=roles_cleaned
++            username=username,
++            password=hash_password(password),
++            roles=roles_cleaned,
++            # CUSTOM: force_password_change patch -- new users must change their
++            # admin-assigned password before doing anything else.
++            force_password_change=True,
+         )
+         db.session.commit()
+         return jsonify({"success": True}), 200
+@@ -201,6 +208,13 @@
+     user = app.security.datastore.find_user(username=username)
+     if user:
+         admin_change_password(user, new_password, False)
++        # CUSTOM: force_password_change patch -- admin_change_password() above
++        # fires Flask-Security's password_changed signal, which our handler
++        # uses to CLEAR force_password_change when a user sets their own new
++        # password. An admin-issued reset is a temporary password too, so
++        # re-set the flag here, after that signal has already run.
++        user.force_password_change = True
++        db.session.add(user)
+         db.session.commit()
+         return jsonify({"success": True}), 200
+     else:
+@@ -215,6 +229,89 @@
+         )
+ 
+ 
++# CUSTOM: force_password_change patch -- lets an admin flag an account so the
++# user is forced to set their own new password on next login, without the
++# admin ever having to choose or type a temporary password for them.
++@user_api_blueprint.route("/api/user/force_password_reset", methods=["POST"])
++@roles_accepted("administrator")
++def force_password_reset():
++    username = bleach.clean(request.json.get("username"))
++    if not username:
++        return jsonify({"success": False, "error": gettext("Please specify a username")}), 400
++
++    user = app.security.datastore.find_user(username=username)
++    if not user:
++        return (
++            jsonify(
++                {
++                    "success": False,
++                    "error": gettext("Could not find user %(username)s", username=username),
++                }
++            ),
++            400,
++        )
++
++    user.force_password_change = True
++    db.session.add(user)
++    db.session.commit()
++    return jsonify({"success": True}), 200
++
++
++# CUSTOM: force_password_change patch -- for a user who has forgotten their
++# password entirely (so force_password_reset alone won't help, since they
++# can't log in with their old one to be prompted). Generates a random
++# temporary password server-side, sets it, and hands it back to the admin to
++# relay to the user. force_password_change is set so it must be changed
++# before anything else works.
++_TEMP_PASSWORD_ALPHABET = "".join(
++    c for c in (string.ascii_letters + string.digits) if c not in "0OoIl1"
++)
++
++
++def _generate_temp_password(length: int = 12) -> str:
++    return "".join(secrets.choice(_TEMP_PASSWORD_ALPHABET) for _ in range(length))
++
++
++@user_api_blueprint.route("/api/user/issue_temp_password", methods=["POST"])
++@roles_accepted("administrator")
++def issue_temp_password():
++    if app.config.get("OTS_ENABLE_LDAP"):
++        return (
++            jsonify(
++                {
++                    "success": False,
++                    "error": gettext(
++                        "LDAP is enabled, please use your LDAP server to reset passwords"
++                    ),
++                }
++            ),
++            400,
++        )
++
++    username = bleach.clean(request.json.get("username"))
++    if not username:
++        return jsonify({"success": False, "error": gettext("Please specify a username")}), 400
++
++    user = app.security.datastore.find_user(username=username)
++    if not user:
++        return (
++            jsonify(
++                {
++                    "success": False,
++                    "error": gettext("Could not find user %(username)s", username=username),
++                }
++            ),
++            400,
++        )
++
++    temp_password = _generate_temp_password()
++    admin_change_password(user, temp_password, False)
++    user.force_password_change = True
++    db.session.add(user)
++    db.session.commit()
++    return jsonify({"success": True, "password": temp_password}), 200
++
++
+ @user_api_blueprint.route("/api/user/deactivate", methods=["POST"])
+ @roles_accepted("administrator")
+ def deactivate_user():
+@@ -315,6 +412,74 @@
+         )
+ 
+ 
++@user_api_blueprint.route("/api/user/site_access/grant", methods=["POST"])
++@roles_accepted("administrator")
++def grant_site_access():
++    username = bleach.clean(request.json.get("username", ""))
++    if not username:
++        return (
++            jsonify(
++                {"success": False, "error": gettext("Please specify the username to grant access to")}
++            ),
++            400,
++        )
++
++    user = app.security.datastore.find_user(username=username)
++    if not user:
++        return (
++            jsonify(
++                {
++                    "success": False,
++                    "error": gettext("User %(username)s does not exist", username=username),
++                }
++            ),
++            400,
++        )
++
++    user.site_access = True
++    db.session.add(user)
++    db.session.commit()
++    return jsonify({"success": True})
++
++
++@user_api_blueprint.route("/api/user/site_access/revoke", methods=["POST"])
++@roles_accepted("administrator")
++def revoke_site_access():
++    username = bleach.clean(request.json.get("username", ""))
++    if not username:
++        return (
++            jsonify(
++                {"success": False, "error": gettext("Please specify the username to revoke access from")}
++            ),
++            400,
++        )
++
++    if username == current_user.username:
++        return (
++            jsonify(
++                {"success": False, "error": gettext("You can't revoke your own website access")}
++            ),
++            400,
++        )
++
++    user = app.security.datastore.find_user(username=username)
++    if not user:
++        return (
++            jsonify(
++                {
++                    "success": False,
++                    "error": gettext("User %(username)s does not exist", username=username),
++                }
++            ),
++            400,
++        )
++
++    user.site_access = False
++    db.session.add(user)
++    db.session.commit()
++    return jsonify({"success": True})
++
++
+ @user_api_blueprint.route("/api/user/role", methods=["POST"])
+ @roles_accepted("administrator")
+ def set_user_role():
+diff -ruN '--exclude=__pycache__' '--exclude=*.bak-*' a/opentakserver/forms/SiteAccessLoginForm.py b/opentakserver/forms/SiteAccessLoginForm.py
+--- a/opentakserver/forms/SiteAccessLoginForm.py	1970-01-01 10:00:00.000000000 +1000
++++ b/opentakserver/forms/SiteAccessLoginForm.py	2026-08-28 18:48:45.382351613 +1000
+@@ -0,0 +1,22 @@
++from flask_babel import gettext
++from flask_security.forms import LoginForm
++
++
++class SiteAccessLoginForm(LoginForm):
++    """Blocks web UI login for users with site_access revoked.
++
++    This only gates /api/login - EUDs and TAK clients authenticate through
++    separate paths (cert auth, EudHandler) and are unaffected.
++    """
++
++    def validate(self, **kwargs):
++        if not super().validate(**kwargs):
++            return False
++
++        if not self.user.site_access:
++            self.ifield.errors.append(
++                gettext("This account does not have access to the web interface")
++            )
++            return False
++
++        return True
+diff -ruN '--exclude=__pycache__' '--exclude=*.bak-*' a/opentakserver/migrations/versions/a1b2c3d4e5f6_add_site_access_to_user.py b/opentakserver/migrations/versions/a1b2c3d4e5f6_add_site_access_to_user.py
+--- a/opentakserver/migrations/versions/a1b2c3d4e5f6_add_site_access_to_user.py	1970-01-01 10:00:00.000000000 +1000
++++ b/opentakserver/migrations/versions/a1b2c3d4e5f6_add_site_access_to_user.py	2026-08-28 18:48:40.553333075 +1000
+@@ -0,0 +1,28 @@
++"""Added site_access column to user table
++
++Revision ID: a1b2c3d4e5f6
++Revises: 00442761c803
++Create Date: 2026-08-28 00:00:00.000000
++
++"""
++
++import sqlalchemy as sa
++from alembic import op
++
++# revision identifiers, used by Alembic.
++revision = "a1b2c3d4e5f6"
++down_revision = "00442761c803"
++branch_labels = None
++depends_on = None
++
++
++def upgrade():
++    with op.batch_alter_table("user", schema=None) as batch_op:
++        batch_op.add_column(
++            sa.Column("site_access", sa.Boolean(), nullable=False, server_default=sa.true())
++        )
++
++
++def downgrade():
++    with op.batch_alter_table("user", schema=None) as batch_op:
++        batch_op.drop_column("site_access")
+diff -ruN '--exclude=__pycache__' '--exclude=*.bak-*' a/opentakserver/models/user.py b/opentakserver/models/user.py
+--- a/opentakserver/models/user.py	2026-08-30 20:16:47.816878484 +1000
++++ b/opentakserver/models/user.py	2026-08-30 10:17:10.981096297 +1000
+@@ -15,6 +15,10 @@
+ @dataclass
+ class User(db.Model, fsqla.FsUserMixin):
+     email = db.Column(String(255), nullable=True)
++    site_access = db.Column(db.Boolean, nullable=False, default=True, server_default="true")
++    # CUSTOM: force_password_change patch -- when true, user is blocked from all
++    # API access except changing their password, until they do so.
++    force_password_change = db.Column(db.Boolean, nullable=False, default=False, server_default="false")
+     video_streams = relationship("VideoStream", back_populates="user")
+     euds = relationship("EUD", back_populates="user")
+     data_packages = relationship("DataPackage", back_populates="user")
+@@ -35,6 +39,7 @@
+             "id": self.id,
+             "username": self.username,
+             "active": self.active,
++            "site_access": self.site_access,
+             "last_login_at": self.last_login_at,
+             "last_login_ip": self.last_login_ip,
+             "current_login_at": self.current_login_at,
+diff -ruN '--exclude=__pycache__' '--exclude=*.bak-*' a/opentakserver/templates/security/base.html b/opentakserver/templates/security/base.html
+--- a/opentakserver/templates/security/base.html	1970-01-01 10:00:00.000000000 +1000
++++ b/opentakserver/templates/security/base.html	2026-08-30 14:25:36.612464792 +1000
+@@ -0,0 +1,111 @@
++{# djlint:off H030,H031 #}
++{# CUSTOM: Raven-branded override of flask_security/templates/security/base.html.
++   Applies to every Flask-Security fallback page (change password, forgot
++   password, etc.) that isn't handled by the React SPA, so they don't look
++   like a bare, unstyled default form. #}
++{% block doc -%}
++<!DOCTYPE html>
++<html{% block html_attribs %}{% endblock html_attribs %}>
++  {%- block html %}
++  <head>
++    {%- block head %}
++    <title>{% block title %}{{ title|default }}{% endblock title %}</title>
++
++      {%- block metas %}
++        <meta charset="UTF-8">
++        <meta name="viewport" content="width=device-width, initial-scale=1.0">
++        <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
++      {%- endblock metas %}
++
++      {%- block head_scripts %}
++      {%- endblock head_scripts %}
++
++      {%- block styles %}
++        <style>
++          :root { color-scheme: dark; }
++          body {
++            margin: 0;
++            min-height: 100vh;
++            display: flex;
++            align-items: center;
++            justify-content: center;
++            padding: 40px 16px;
++            background: rgb(35, 37, 41);
++            color: #fff;
++            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
++          }
++          .fs-card {
++            width: 100%;
++            max-width: 420px;
++            background:
++              radial-gradient(ellipse 55% 50% at 15% 0%, rgba(255, 255, 255, 0.08), transparent 60%),
++              radial-gradient(ellipse 65% 55% at 100% 25%, rgba(0, 0, 0, 0.25), transparent 60%),
++              radial-gradient(ellipse 75% 60% at 25% 115%, rgba(0, 0, 0, 0.3), transparent 60%),
++              #373a40;
++            border-radius: 16px;
++            padding: 32px;
++            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
++          }
++          .fs-card img.fs-logo { display: block; height: 80px; width: auto; margin: 0 auto 24px; }
++          .fs-card h1 { font-size: 1.3rem; text-align: center; margin: 0 0 20px; }
++          .fs-card h3 { font-size: 1rem; font-weight: 400; text-align: center; color: rgba(255, 255, 255, 0.75); }
++          .fs-div { margin-bottom: 14px; }
++          .fs-div label { display: block; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; color: rgba(255, 255, 255, 0.55); margin-bottom: 6px; }
++          .fs-div input[type="text"],
++          .fs-div input[type="email"],
++          .fs-div input[type="password"],
++          .fs-div input[type="tel"] {
++            width: 100%;
++            box-sizing: border-box;
++            background: transparent;
++            border: 1px solid rgba(255, 255, 255, 0.35);
++            border-radius: 8px;
++            padding: 10px 12px;
++            color: #fff;
++            font-size: 0.95rem;
++          }
++          .fs-div input:focus { outline: none; border-color: rgba(255, 255, 255, 0.7); }
++          input[type="submit"], button[type="submit"] {
++            width: 100%;
++            background: #fff;
++            color: rgb(35, 37, 41);
++            border: none;
++            border-radius: 8px;
++            padding: 11px 12px;
++            font-weight: 700;
++            letter-spacing: 0.5px;
++            font-size: 0.9rem;
++            cursor: pointer;
++            margin-top: 6px;
++          }
++          input[type="submit"]:hover, button[type="submit"]:hover { opacity: 0.9; }
++          .fs-error-msg { color: #ff8787; font-size: 0.85rem; }
++          #fs-form-errors ul { list-style: none; padding: 0; margin: 6px 0 0; }
++          .fs-div ul { list-style: none; padding: 0; margin: 6px 0 0; }
++          .fs-card hr { border: none; border-top: 1px solid rgba(255, 255, 255, 0.15); margin: 24px 0 12px; }
++          .fs-card h2 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; color: rgba(255, 255, 255, 0.5); text-align: center; margin: 0 0 10px; font-weight: 600; }
++          .fs-card > ul, .fs-card ul ul { list-style: none; padding: 0; margin: 0; text-align: center; }
++          .fs-card > ul li { margin-bottom: 8px; font-size: 0.85rem; }
++          .fs-card a { color: rgba(255, 255, 255, 0.65); text-decoration: none; }
++          .fs-card a:hover { color: #fff; text-decoration: underline; }
++        </style>
++      {%- endblock styles %}
++    {%- endblock head %}
++  </head>
++  <body{% block body_attribs %}{% endblock body_attribs %}>
++    {% block body -%}
++      {% block navbar %}
++      {%- endblock navbar %}
++      <div class="fs-card">
++        <img class="fs-logo" src="/raven-logo.png" alt="C4 Raven">
++        {% block content -%}
++        {%- endblock content %}
++      </div>
++
++      {% block scripts %}
++      {%- endblock scripts %}
++    {%- endblock body %}
++  </body>
++  {%- endblock html %}
++</html>
++{% endblock doc -%}
+diff -ruN '--exclude=__pycache__' '--exclude=*.bak-*' a/opentakserver/templates/security/change_password.html b/opentakserver/templates/security/change_password.html
+--- a/opentakserver/templates/security/change_password.html	1970-01-01 10:00:00.000000000 +1000
++++ b/opentakserver/templates/security/change_password.html	2026-08-30 14:29:08.054181337 +1000
+@@ -0,0 +1,22 @@
++{# CUSTOM: Raven-branded override -- drops the flashed "password changed"
++   message and the Flask-Security nav menu links, keeping just the form. #}
++{% set title = title|default(_fsdomain('Change Password')) %}
++{% extends "security/base.html" %}
++{% from "security/_macros.html" import render_field_with_errors, render_field, render_field_errors, render_form_errors %}
++
++{% block content %}
++  <h1>{{ _fsdomain('Change Password') }}</h1>
++  <form action="{{ url_for_security('change_password') }}" method="post" name="change_password_form">
++    {{ change_password_form.hidden_tag() }}
++    {{ render_form_errors(change_password_form) }}
++    {% if active_password %}
++      {{ render_field_with_errors(change_password_form.password) }}
++    {% else %}
++      <h3>{{ _fsdomain('You do not currently have a password - this will add one.') }}</h3>
++    {% endif %}
++    {{ render_field_with_errors(change_password_form.new_password) }}
++    {{ render_field_with_errors(change_password_form.new_password_confirm) }}
++    {{ render_field_errors(change_password_form.csrf_token) }}
++    {{ render_field(change_password_form.submit) }}
++  </form>
++{% endblock content %}
