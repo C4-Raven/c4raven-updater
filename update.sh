@@ -30,10 +30,10 @@ RAVEN_VENV="${RAVEN_VENV:-$HOME/.opentakserver_venv}"
 RAVEN_DATA_DIR="${RAVEN_DATA_DIR:-$HOME/ots}"
 RAVEN_SERVICES="${RAVEN_SERVICES:-opentakserver.service eud_handler.service eud_handler_ssl.service cot_parser.service}"
 
-SERVER_REPO="${SERVER_REPO:-https://github.com/C4Raven/c4raven-server.git}"
+SERVER_REPO="${SERVER_REPO:-https://github.com/C4-Raven/c4raven-server.git}"
 SERVER_SRC_DIR="${SERVER_SRC_DIR:-$HOME/src/c4raven-server}"
 
-UI_REPO="${UI_REPO:-https://github.com/C4Raven/c4raven-ui.git}"
+UI_REPO="${UI_REPO:-https://github.com/C4-Raven/c4raven-ui.git}"
 UI_SRC_DIR="${UI_SRC_DIR:-$HOME/src/c4raven-ui}"
 UI_DEPLOY_DIR="${UI_DEPLOY_DIR:-/var/www/html/opentakserver}"
 
@@ -83,7 +83,11 @@ fi
 
 # ---- back up the data directory (config, certs, uploads, icons) ------------
 log "Backing up $RAVEN_DATA_DIR (excluding logs/)"
-tar --exclude='logs' -czf "$BACKUP_DIR/raven-data.tar.gz" -C "$(dirname "$RAVEN_DATA_DIR")" "$(basename "$RAVEN_DATA_DIR")"
+# The data dir is live (icons.sqlite, uploads); tar exits 1 for "file changed
+# as we read it", which is a warning here, not a failed backup. Anything
+# else (exit 2) is a real error and still aborts.
+tar --warning=no-file-changed --exclude='logs' -czf "$BACKUP_DIR/raven-data.tar.gz" \
+    -C "$(dirname "$RAVEN_DATA_DIR")" "$(basename "$RAVEN_DATA_DIR")" || [[ $? -eq 1 ]]
 
 # ---- back up the currently-deployed UI --------------------------------------
 if [[ -d "$UI_DEPLOY_DIR" ]]; then
@@ -98,9 +102,14 @@ log "Backup complete. Nothing destructive has happened yet."
 if [[ "$SKIP_BACKEND" != "1" ]]; then
     if [[ -d "$SERVER_SRC_DIR/.git" ]]; then
         log "Fetching c4raven-server"
+        # raven/__init__.py is a version stamp that poetry-dynamic-versioning
+        # rewrites on every `pip install -e`; discard that drift so it can't
+        # block the fast-forward (git refuses to overwrite a modified file).
+        git -C "$SERVER_SRC_DIR" checkout -- raven/__init__.py 2>/dev/null || true
         git -C "$SERVER_SRC_DIR" fetch origin
         if ! git -C "$SERVER_SRC_DIR" merge --ff-only origin/main; then
-            die "c4raven-server has local commits/changes that aren't on origin/main -- won't fast-forward over them. Resolve manually in $SERVER_SRC_DIR (commit/stash/push as appropriate), then re-run."
+            git -C "$SERVER_SRC_DIR" status --short
+            die "c4raven-server has local commits or modified files (listed above) that block a fast-forward to origin/main. Resolve them in $SERVER_SRC_DIR (commit/stash/push as appropriate), then re-run."
         fi
     else
         log "Cloning c4raven-server"
@@ -120,9 +129,13 @@ fi
 if [[ "$SKIP_UI" != "1" ]]; then
     log "Updating c4raven-ui source"
     if [[ -d "$UI_SRC_DIR/.git" ]]; then
+        # src/_versions.ts is a build stamp that `yarn build` rewrites every
+        # run; discard it so it can't block the fast-forward.
+        git -C "$UI_SRC_DIR" checkout -- src/_versions.ts 2>/dev/null || true
         git -C "$UI_SRC_DIR" fetch origin
         if ! git -C "$UI_SRC_DIR" merge --ff-only origin/main; then
-            die "c4raven-ui has local commits/changes that aren't on origin/main -- won't fast-forward over them. Resolve manually in $UI_SRC_DIR, then re-run."
+            git -C "$UI_SRC_DIR" status --short
+            die "c4raven-ui has local commits or modified files (listed above) that block a fast-forward to origin/main. Resolve them in $UI_SRC_DIR, then re-run."
         fi
     else
         git clone "$UI_REPO" "$UI_SRC_DIR"
@@ -131,18 +144,22 @@ if [[ "$SKIP_UI" != "1" ]]; then
     log "Building UI"
     (
         cd "$UI_SRC_DIR"
-        if command -v corepack >/dev/null 2>&1; then
-            corepack yarn install --immutable
-            corepack yarn build
-        else
-            warn "corepack not found, falling back to npm"
-            npx --yes ts-appversion --git=.
-            npx --yes vite build
-        fi
+        # c4raven-ui pins yarn 4 via package.json's packageManager field;
+        # `corepack yarn` runs that exact version. There is no npm fallback:
+        # npm doesn't understand the yarn 4 lockfile and would corrupt it.
+        command -v corepack >/dev/null 2>&1 || die "corepack not found (needed to run the pinned yarn 4). Install Node with corepack, or: sudo npm install -g corepack"
+        corepack yarn install --immutable
+        corepack yarn build
     )
 
     log "Deploying UI to $UI_DEPLOY_DIR"
-    rsync -a --delete "$UI_SRC_DIR/dist/" "$UI_DEPLOY_DIR/" 2>&1 | grep -v "chgrp\|rsync error\|code 23" || true
+    # --no-perms/--no-owner/--no-group/--omit-dir-times: don't try to set
+    # metadata on the webroot itself (we may not own it), which is the only
+    # thing that used to make rsync exit 23 here. Everything else is a real
+    # failure and must not be swallowed -- a half-deployed UI plus a service
+    # restart is worse than stopping.
+    rsync -a --no-perms --no-owner --no-group --omit-dir-times --delete \
+        "$UI_SRC_DIR/dist/" "$UI_DEPLOY_DIR/" || die "UI deploy to $UI_DEPLOY_DIR failed (rsync exit $?)"
 else
     warn "SKIP_UI=1 -- frontend left untouched"
 fi

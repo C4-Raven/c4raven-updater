@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/C4Raven/c4raven-server-setup/master/docs/logo.png" alt="C4 Raven" width="480">
+  <img src="https://raw.githubusercontent.com/C4-Raven/c4raven-server-setup/master/docs/logo.png" alt="C4 Raven" width="480">
 </p>
 
 # C4 Raven updater
 
-Deploys the latest [c4raven-server](https://github.com/C4Raven/c4raven-server)
-(backend) and [c4raven-ui](https://github.com/C4Raven/c4raven-ui)
+Deploys the latest [c4raven-server](https://github.com/C4-Raven/c4raven-server)
+(backend) and [c4raven-ui](https://github.com/C4-Raven/c4raven-ui)
 (frontend) to an existing install, in one command, without losing your
 data.
 
@@ -51,7 +51,7 @@ made.
 ## Usage
 
 ```
-git clone https://github.com/C4Raven/c4raven-updater.git
+git clone https://github.com/C4-Raven/c4raven-updater.git
 cd c4raven-updater
 ./update.sh
 ```
@@ -61,9 +61,17 @@ GitHub and your npm registry.
 
 ### Configuration
 
-The script assumes the same layout as a fresh install from
-[c4raven-server-setup](https://github.com/C4Raven/c4raven-server-setup).
-If your paths differ, override with environment variables:
+> **Which updater?** This script is for the *legacy* single-user layout
+> (backend in `~/.opentakserver_venv`, data in `~/ots`, UI served from
+> `/var/www/html/opentakserver`, `opentakserver.service`). Servers set up
+> by [c4raven-server-setup](https://github.com/C4-Raven/c4raven-server-setup)
+> use a different layout (`raven` system user, `/opt/raven`,
+> `raven.service`) and are updated with *that* repo's `update.sh` (or by
+> installing its newer `.deb`) instead. Running this script there stops
+> at "RAVEN_VENV not found" without changing anything.
+
+If your paths differ from the legacy defaults, override with environment
+variables:
 
 | Variable          | Default                        | What it is                                       |
 |-------------------|---------------------------------|---------------------------------------------------|
@@ -74,6 +82,9 @@ If your paths differ, override with environment variables:
 | `UI_SRC_DIR`      | `~/src/c4raven-ui`               | Where the frontend source is cloned/built          |
 | `UI_DEPLOY_DIR`   | `/var/www/html/opentakserver`   | Where the built frontend is served from            |
 | `BACKUP_ROOT`     | `~/backups`                     | Where timestamped backups are written              |
+| `SERVER_REPO`     | `https://github.com/C4-Raven/c4raven-server.git` | Cloned only if `SERVER_SRC_DIR` doesn't exist yet |
+| `UI_REPO`         | `https://github.com/C4-Raven/c4raven-ui.git` | Cloned only if `UI_SRC_DIR` doesn't exist yet |
+| `HEALTH_URL`      | `https://127.0.0.1/api/health`  | Polled after the restart until it returns 200      |
 | `SKIP_UI`         | `0`                              | Set to `1` to update the backend only              |
 | `SKIP_BACKEND`    | `0`                              | Set to `1` to update the frontend only             |
 
@@ -124,10 +135,10 @@ git merge upstream/master
 Watch in particular for:
 - Any file upstream added that references `opentakserver.*` internally
   — needs the same rename treatment as the rest of the codebase.
-- New `OTS_*` config keys — need a `RAVEN_*` counterpart added to
-  `config.example.yml` in
-  [c4raven-server-setup](https://github.com/C4Raven/c4raven-server-setup)
-  and to your own `config.yml`.
+- New `OTS_*` config keys — need a `RAVEN_*` counterpart in
+  `raven/defaultconfig.py` (which is what `flask raven generate-config`
+  and the app's startup defaults are built from) and, if you override
+  them, in your own `config.yml`.
 - New references to the server's own operational certificate, the
   plugin entry-point group, or anything else that has to match real
   external state rather than just our naming — these need to keep
