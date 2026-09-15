@@ -20,10 +20,10 @@ that separate, deliberate task.
 1. Backs up your database, your data directory (config, certificates,
    uploads, icons), and the currently-deployed UI to a timestamped folder
    under `~/backups/`.
-2. Fast-forwards `c4raven-server` to its `origin/master` and reinstalls
+2. Fast-forwards `c4raven-server` to its `origin/main` and reinstalls
    it into the venv (editable install — no separate patch step, the
    customizations are just part of the fork's commit history).
-3. Fast-forwards `c4raven-ui` to its `origin/master`, builds it, and
+3. Fast-forwards `c4raven-ui` to its `origin/main`, builds it, and
    deploys it.
 4. Restarts `opentakserver.service`, `eud_handler.service`,
    `eud_handler_ssl.service`, and `cot_parser.service` (all four run
@@ -42,7 +42,7 @@ app runs them on startup, no separate step needed.
   MediaMTX config are all left alone. Never touches `logs/`.
 - Never merges or rebases over local, uncommitted work in either source
   checkout. If either has commits or changes that aren't on its
-  `origin/master`, the script stops and tells you rather than trying to
+  `origin/main`, the script stops and tells you rather than trying to
   reconcile them for you.
 
 Everything that could go wrong is backed up first, before any change is
@@ -130,11 +130,13 @@ Watch in particular for:
   and to your own `config.yml`.
 - New references to the server's own operational certificate, the
   plugin entry-point group, or anything else that has to match real
-  external state rather than just our naming — see the "Revert the
-  server's own cert identity and plugin group from the rename" commit
-  in `c4raven-server`'s history for what that class of exception looks
-  like.
+  external state rather than just our naming — these need to keep
+  pointing at the real, already-deployed paths (`certs/raven/`, the
+  `raven.plugin` entry-point group) rather than being renamed to match
+  whatever upstream calls them, since renaming them for real means
+  coordinating actual files already on the live server, not just a
+  text substitution.
 
 Test it (`create_app()` should import and boot cleanly, ideally against
-a copy of a real `config.yml`), then push to `origin/master`. Only then
+a copy of a real `config.yml`), then push to `origin/main`. Only then
 does a normal `./update.sh` run pick it up.

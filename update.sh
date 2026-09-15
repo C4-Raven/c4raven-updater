@@ -9,7 +9,7 @@
 # deliberate maintenance step (see "Pulling in upstream changes" in
 # README.md) done by a maintainer in a dev checkout, tested, and pushed
 # to our fork first. This script only ever fast-forwards to what's
-# already on our own origin/master.
+# already on our own origin/main.
 #
 # What this does NOT do, ever:
 #   - drop, recreate, or truncate the database (only additive Alembic
@@ -99,8 +99,8 @@ if [[ "$SKIP_BACKEND" != "1" ]]; then
     if [[ -d "$SERVER_SRC_DIR/.git" ]]; then
         log "Fetching c4raven-server"
         git -C "$SERVER_SRC_DIR" fetch origin
-        if ! git -C "$SERVER_SRC_DIR" merge --ff-only origin/master; then
-            die "c4raven-server has local commits/changes that aren't on origin/master -- won't fast-forward over them. Resolve manually in $SERVER_SRC_DIR (commit/stash/push as appropriate), then re-run."
+        if ! git -C "$SERVER_SRC_DIR" merge --ff-only origin/main; then
+            die "c4raven-server has local commits/changes that aren't on origin/main -- won't fast-forward over them. Resolve manually in $SERVER_SRC_DIR (commit/stash/push as appropriate), then re-run."
         fi
     else
         log "Cloning c4raven-server"
@@ -121,8 +121,8 @@ if [[ "$SKIP_UI" != "1" ]]; then
     log "Updating c4raven-ui source"
     if [[ -d "$UI_SRC_DIR/.git" ]]; then
         git -C "$UI_SRC_DIR" fetch origin
-        if ! git -C "$UI_SRC_DIR" merge --ff-only origin/master; then
-            die "c4raven-ui has local commits/changes that aren't on origin/master -- won't fast-forward over them. Resolve manually in $UI_SRC_DIR, then re-run."
+        if ! git -C "$UI_SRC_DIR" merge --ff-only origin/main; then
+            die "c4raven-ui has local commits/changes that aren't on origin/main -- won't fast-forward over them. Resolve manually in $UI_SRC_DIR, then re-run."
         fi
     else
         git clone "$UI_REPO" "$UI_SRC_DIR"
