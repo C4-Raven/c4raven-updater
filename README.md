@@ -21,13 +21,30 @@ that separate, deliberate task.
    uploads, icons), and the currently-deployed UI to a timestamped folder
    under `~/backups/`.
 2. Fast-forwards `c4raven-server` to its `origin/main` and reinstalls
-   it into the venv (editable install — no separate patch step, the
-   customizations are just part of the fork's commit history).
+   it into the venv (no separate patch step, the customizations are just
+   part of the fork's commit history).
 3. Fast-forwards `c4raven-ui` to its `origin/main`, builds it, and
    deploys it.
-4. Restarts `opentakserver.service`, `eud_handler.service`,
-   `eud_handler_ssl.service`, and `cot_parser.service` (all four run
-   from the same backend install) and waits for the health check.
+4. Restarts the backend services (they all run from the same backend
+   install) and waits for the health check.
+
+It works on both server layouts and picks the right one by itself:
+
+| | Legacy | `raven` (fresh install from GitHub) |
+|---|---|---|
+| Set up by | the original single-user install | [c4raven-server-setup](https://github.com/C4-Raven/c4raven-server-setup)'s `install.sh` or online `.deb` |
+| Owner | your login user | the `raven` system user |
+| Backend | `~/src/c4raven-server`, venv `~/.opentakserver_venv` | `/opt/raven/c4raven-server` (Poetry venv in `.venv`) |
+| Data | `~/ots` | `/opt/raven/data` |
+| UI served from | `/var/www/html/opentakserver` | `/var/www/html/raven` |
+| Services | `opentakserver`, `eud_handler`, `eud_handler_ssl`, `cot_parser` | `raven`, `eud_handler`, `eud_handler_ssl`, `cot_parser`, `mediamtx` (+ `federation-hub` if running) |
+
+Legacy is used when `~/.opentakserver_venv` exists, otherwise `raven`
+when `/opt/raven/c4raven-server` is a git checkout. On the `raven` layout
+every git, Poetry and yarn step runs as the `raven` user (via `sudo -u
+raven`), so file ownership stays the way `install.sh` left it. A server
+installed from the **offline** `.deb` has no source checkout to pull; the
+script refuses it and points you at a newer offline bundle instead.
 
 Database migrations run themselves, the same way they always have — the
 app runs them on startup, no separate step needed.
@@ -56,35 +73,32 @@ cd c4raven-updater
 ./update.sh
 ```
 
-Requires `sudo` access to restart the services, and network access to
-GitHub and your npm registry.
+Run it as your own sudo-capable user (not root, not `raven`). It needs
+`sudo` to restart the services (and, on the `raven` layout, to act as
+the `raven` user), plus network access to GitHub and your npm registry.
 
 ### Configuration
 
-> **Which updater?** This script is for the *legacy* single-user layout
-> (backend in `~/.opentakserver_venv`, data in `~/ots`, UI served from
-> `/var/www/html/opentakserver`, `opentakserver.service`). Servers set up
-> by [c4raven-server-setup](https://github.com/C4-Raven/c4raven-server-setup)
-> use a different layout (`raven` system user, `/opt/raven`,
-> `raven.service`) and are updated with *that* repo's `update.sh` (or by
-> installing its newer `.deb`) instead. Running this script there stops
-> at "RAVEN_VENV not found" without changing anything.
-
-If your paths differ from the legacy defaults, override with environment
-variables:
+If your paths differ from the defaults, override with environment
+variables. Where a default differs by layout it's shown as
+legacy / `raven`:
 
 | Variable          | Default                        | What it is                                       |
 |-------------------|---------------------------------|---------------------------------------------------|
-| `RAVEN_VENV`      | `~/.opentakserver_venv`         | Python virtualenv the backend runs from            |
-| `RAVEN_DATA_DIR`  | `~/ots`                         | Data dir (`config.yml`, certs, uploads, ...)       |
-| `RAVEN_SERVICES`  | see `update.sh`                 | Space-separated systemd units to restart           |
-| `SERVER_SRC_DIR`  | `~/src/c4raven-server`          | Backend source checkout used for the editable install |
-| `UI_SRC_DIR`      | `~/src/c4raven-ui`               | Where the frontend source is cloned/built          |
-| `UI_DEPLOY_DIR`   | `/var/www/html/opentakserver`   | Where the built frontend is served from            |
+| `LAYOUT`          | `auto`                          | `legacy` or `raven` to skip detection              |
+| `RAVEN_HOME`      | `/opt/raven`                    | Root of the `raven` layout                         |
+| `RAVEN_USER`      | `raven`                         | Account that owns the `raven` layout               |
+| `RAVEN_VENV`      | `~/.opentakserver_venv` / `/opt/raven/c4raven-server/.venv` | Python virtualenv the backend runs from |
+| `RAVEN_DATA_DIR`  | `~/ots` / `/opt/raven/data`     | Data dir (`config.yml`, certs, uploads, ...)       |
+| `RAVEN_SERVICES`  | see the table above             | Space-separated systemd units to restart           |
+| `SERVER_SRC_DIR`  | `~/src/c4raven-server` / `/opt/raven/c4raven-server` | Backend source checkout |
+| `UI_SRC_DIR`      | `~/src/c4raven-ui` / `/opt/raven/c4raven-ui` | Where the frontend source is cloned/built |
+| `UI_DEPLOY_DIR`   | `/var/www/html/opentakserver` / `/var/www/html/raven` | Where the built frontend is served from |
 | `BACKUP_ROOT`     | `~/backups`                     | Where timestamped backups are written              |
 | `SERVER_REPO`     | `https://github.com/C4-Raven/c4raven-server.git` | Cloned only if `SERVER_SRC_DIR` doesn't exist yet |
 | `UI_REPO`         | `https://github.com/C4-Raven/c4raven-ui.git` | Cloned only if `UI_SRC_DIR` doesn't exist yet |
-| `HEALTH_URL`      | `https://127.0.0.1/api/health`  | Polled after the restart until it returns 200      |
+| `HEALTH_URL`      | `https://127.0.0.1/api/health` / `http://127.0.0.1:8081/api/health` | Polled after the restart until it returns 200 |
+| `HEALTH_TRIES`    | `30`                             | Health checks, 2 seconds apart                     |
 | `SKIP_UI`         | `0`                              | Set to `1` to update the backend only              |
 | `SKIP_BACKEND`    | `0`                              | Set to `1` to update the frontend only             |
 
@@ -101,17 +115,23 @@ anything, printed at the end of the run (also under `~/backups/update-*`).
 Inside it:
 
 - `server-commit.txt` — the backend git commit that was checked out
-  before the update, e.g. `git -C ~/src/c4raven-server checkout $(cat server-commit.txt)`
-  then re-run `pip install -e ~/src/c4raven-server` in the venv
+  before the update. Legacy: `git -C ~/src/c4raven-server checkout $(cat server-commit.txt)`
+  then re-run `pip install -e ~/src/c4raven-server` in the venv. `raven`
+  layout: `sudo -u raven -H bash -lc "cd /opt/raven/c4raven-server && git checkout $(cat server-commit.txt) && poetry install"`
 - `database.sql.gz` — a full `pg_dump`, restore with
   `gunzip -c database.sql.gz | psql <connection-string>`
 - `raven-data.tar.gz` — your data directory (minus logs), restore by
-  extracting it back over your data dir
+  extracting it back over your data dir (with `sudo` on the `raven`
+  layout, then `sudo chown -R raven:raven /opt/raven/data`)
 - `ui/` — the previously-deployed frontend, restore with
-  `rsync -a --delete ui/ /var/www/html/opentakserver/`
+  `rsync -a --delete ui/ <UI served from>/`
 
-After restoring whichever pieces you need, restart the services:
-`sudo systemctl restart opentakserver.service eud_handler.service eud_handler_ssl.service cot_parser.service`.
+The backup directory is readable by you only: it holds `config.yml` and
+the certificate authority's private keys.
+
+After restoring whichever pieces you need, restart the services listed
+in the table above, e.g. on the `raven` layout:
+`sudo systemctl restart raven eud_handler eud_handler_ssl cot_parser mediamtx`.
 
 ## Pulling in upstream changes
 
