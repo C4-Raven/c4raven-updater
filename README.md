@@ -108,6 +108,17 @@ Example:
 RAVEN_DATA_DIR=/opt/ots ./update.sh
 ```
 
+## Login problems
+
+`./diagnose-login.sh` (on the `raven` layout) checks why the web UI won't
+log in, without changing anything: service states, code versions, the
+login-related settings (no secrets), every account's active / site-access
+/ forced-password-change / two-factor flags, a scripted browser-style
+login both straight to the backend and through nginx, the nginx sites and
+certificates, and recent errors. It tests `administrator` / `password` by
+default; use `LOGIN_USER=... LOGIN_PASS=... ./diagnose-login.sh` for
+another account.
+
 ## Rolling back
 
 Every run writes a timestamped backup directory before touching
