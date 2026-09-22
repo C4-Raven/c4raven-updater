@@ -259,6 +259,14 @@ fi
 if [[ "$LAYOUT" == raven ]] && systemctl is-active --quiet federation-hub 2>/dev/null; then
     RAVEN_SERVICES="$RAVEN_SERVICES federation-hub.service"
 fi
+# A server whose install.sh stopped early has no raven.service at all (the
+# units are written near the very end of install.sh), so there is nothing to
+# restart and no backend to log in to. Finish the install instead: that
+# writes the missing units, starts everything and tests a login.
+if [[ "$LAYOUT" == raven ]] && ! systemctl cat raven.service >/dev/null 2>&1; then
+    warn "raven.service doesn't exist: this server's install.sh never finished. Running finish-install.sh to complete it."
+    exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/finish-install.sh"
+fi
 log "Restarting: $RAVEN_SERVICES"
 # shellcheck disable=SC2086
 sudo systemctl restart $RAVEN_SERVICES
