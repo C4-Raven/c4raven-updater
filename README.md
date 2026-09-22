@@ -108,6 +108,17 @@ Example:
 RAVEN_DATA_DIR=/opt/ots ./update.sh
 ```
 
+## Finishing a half-done install
+
+If `./update.sh` reports `Unit raven.service not found`, the server's
+`install.sh` stopped partway (it exits at the first failed command) and
+the backend was never set up to run, so nobody can log in.
+`./finish-install.sh` redoes everything after the UI build (RabbitMQ with
+its plugins enabled first, the secrets file, the raven / eud_handler /
+cot_parser units), starts the services, waits for the backend and tests
+an `administrator` login. Each step prints the real error if it fails. It
+leaves the database contents, `config.yml`, certificates and nginx alone.
+
 ## Login problems
 
 `./diagnose-login.sh` (on the `raven` layout) checks why the web UI won't
