@@ -215,8 +215,12 @@ if [[ "$SKIP_UI" != "1" ]]; then
     log "Updating c4raven-ui source"
     if as_app test -d "$UI_SRC_DIR/.git"; then
         # src/_versions.ts is a build stamp that `yarn build` rewrites every
-        # run; discard it so it can't block the fast-forward.
-        as_app git -C "$UI_SRC_DIR" checkout -- src/_versions.ts 2>/dev/null || true
+        # run; discard it so it can't block the fast-forward. yarn.lock too:
+        # it's generated, and a plain `yarn install` (install.sh ran one
+        # before the lockfile's workspace entry was fixed upstream) rewrites
+        # it locally, which blocks every later pull. The build below uses
+        # --immutable, so whatever origin/main's lockfile says is what's used.
+        as_app git -C "$UI_SRC_DIR" checkout -- src/_versions.ts yarn.lock 2>/dev/null || true
         as_app git -C "$UI_SRC_DIR" fetch origin
         if ! as_app git -C "$UI_SRC_DIR" merge --ff-only origin/main; then
             as_app git -C "$UI_SRC_DIR" status --short
