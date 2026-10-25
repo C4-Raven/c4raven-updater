@@ -18,12 +18,51 @@ LOGIN_PASS="${LOGIN_PASS:-password}"
 h() { printf '\n===== %s\n' "$1"; }
 as_raven() { sudo -u raven -H bash -lc "cd / && $1"; }
 
+# Reading config.yml needs PyYAML, which is a dependency of the backend and
+# so lives in the backend's venv -- not necessarily in the system python3.
+# On Rocky/RHEL that matters: /usr/bin/python3 is 3.9 (too old for the server
+# anyway) and the EL stack installs python3.12-pyyaml, not python3-pyyaml, so
+# a bare `python3 -c "import yaml"` raises ModuleNotFoundError on exactly the
+# boxes this script exists to diagnose. Prefer the venv interpreter (source
+# install, then the offline package's), then whichever system python can
+# actually import yaml.
+RAVEN_PY=""
+for _p in "$RAVEN_HOME/c4raven-server/.venv/bin/python" "$RAVEN_HOME/venv/bin/python"; do
+  if sudo test -x "$_p"; then RAVEN_PY="$_p"; break; fi
+done
+if [ -z "$RAVEN_PY" ]; then
+  for _p in python3.12 python3; do
+    if command -v "$_p" >/dev/null 2>&1 && "$_p" -c 'import yaml' >/dev/null 2>&1; then
+      RAVEN_PY="$_p"; break
+    fi
+  done
+fi
+RAVEN_PY="${RAVEN_PY:-python3}"
+
+# PG_SERVICE is `postgresql` on both families as installed, but EL users who
+# took rpm/c4raven-el9-repos.sh's PGDG advice have a versioned unit name
+# (postgresql-16). Only a status line, but let them say so.
+PG_SERVICE="${PG_SERVICE:-postgresql}"
+
 h "System"
 . /etc/os-release; echo "$PRETTY_NAME, $(uname -m)"
 echo "python3: $(python3 --version 2>&1)"
+# Through as_raven, the same way the config reads below run it: $RAVEN_PY may
+# be inside /opt/raven, which the invoking user need not be able to execute.
+echo "config reader: $RAVEN_PY ($(as_raven "$RAVEN_PY --version" 2>&1))"
+# Rocky/RHEL enable SELinux and firewalld by default, and either can break a
+# login that looks fine from the backend's own side: SELinux blocks nginx's
+# proxy_pass to 127.0.0.1:8081 unless httpd_can_network_connect is on (every
+# request 502s), and firewalld drops 443/8089 unless they've been opened.
+if command -v getenforce >/dev/null 2>&1; then
+  echo "selinux: $(getenforce 2>&1) | httpd_can_network_connect: $(getsebool httpd_can_network_connect 2>/dev/null | awk '{print $3}' || echo '?')"
+fi
+if command -v firewall-cmd >/dev/null 2>&1; then
+  echo "firewalld: $(firewall-cmd --state 2>&1) | open: $(sudo firewall-cmd --list-ports 2>/dev/null) $(sudo firewall-cmd --list-services 2>/dev/null)"
+fi
 
 h "Services"
-for s in raven eud_handler eud_handler_ssl cot_parser mediamtx fedhub_bridge nginx postgresql rabbitmq-server; do
+for s in raven eud_handler eud_handler_ssl cot_parser mediamtx fedhub_bridge nginx "$PG_SERVICE" rabbitmq-server; do
   printf '%-18s %s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null)"
 done
 
@@ -33,7 +72,7 @@ echo "ui:     $(as_raven "git -C $RAVEN_HOME/c4raven-ui log -1 --format='%h %cd 
 echo "ui files deployed: $(ls /var/www/html/raven 2>/dev/null | wc -l) (index.html: $(test -f /var/www/html/raven/index.html && echo yes || echo NO))"
 
 h "Settings that affect login (no secrets)"
-as_raven "python3 - '$DATA/config.yml'" <<'EOF'
+as_raven "$RAVEN_PY - '$DATA/config.yml'" <<'EOF'
 import sys, yaml
 c = yaml.safe_load(open(sys.argv[1]))
 for k in ["RAVEN_TURNSTILE_ENABLE", "RAVEN_ENABLE_EMAIL", "RAVEN_ENABLE_LDAP",
@@ -48,7 +87,7 @@ EOF
 echo "secrets env keys: $(sudo cut -d= -f1 "$RAVEN_HOME/.raven-secrets.env" 2>/dev/null | tr '\n' ' ')"
 
 h "Accounts"
-DBNAME=$(as_raven "python3 -c \"import yaml; print(yaml.safe_load(open('$DATA/config.yml'))['SQLALCHEMY_DATABASE_URI'].rsplit('/',1)[-1])\"" 2>/dev/null)
+DBNAME=$(as_raven "$RAVEN_PY -c \"import yaml; print(yaml.safe_load(open('$DATA/config.yml'))['SQLALCHEMY_DATABASE_URI'].rsplit('/',1)[-1])\"" 2>/dev/null)
 sudo -u postgres psql -d "${DBNAME:-raven}" -XAt -F ' | ' -c "
   select u.username, 'active='||u.active, 'site_access='||u.site_access,
          'force_password_change='||u.force_password_change,
@@ -107,13 +146,32 @@ EOF
 h "Login test: straight to the backend (127.0.0.1:8081)"
 login_test "http://127.0.0.1:8081" ""
 
-DOMAIN=$(sudo grep -rhoE 'server_name\s+[^;]+' /etc/nginx/sites-enabled/ 2>/dev/null | awk '{for(i=2;i<=NF;i++) print $i}' | grep -vE '^(_|raven_[0-9]+|opentakserver_[0-9]+|localhost)$' | grep '\.' | head -1)
+# Where the enabled site lives depends on the distro: sites-enabled on
+# Debian/Ubuntu, conf.d on Rocky/RHEL (which has no sites-enabled at all).
+NGINX_DIRS=()
+for d in /etc/nginx/sites-enabled /etc/nginx/conf.d; do
+  [[ -d "$d" ]] && NGINX_DIRS+=("$d")
+done
+
+# -R, not -r: every entry in Debian's sites-enabled is a symlink into
+# sites-available, and `grep -r` *skips* symlinks it meets while recursing
+# (only ones named directly on the command line are followed). With -r this
+# finds nothing at all on Debian/Ubuntu, which is where almost every install
+# is. -R dereferences them. Same below.
+DOMAIN=""
+if [[ ${#NGINX_DIRS[@]} -gt 0 ]]; then
+  DOMAIN=$(sudo grep -RhoE 'server_name\s+[^;]+' "${NGINX_DIRS[@]}" 2>/dev/null | awk '{for(i=2;i<=NF;i++) print $i}' | grep -vE '^(_|raven_[0-9]+|opentakserver_[0-9]+|localhost)$' | grep '\.' | head -1)
+fi
 h "Login test: through nginx on 443 (as ${DOMAIN:-the server IP})"
 login_test "https://127.0.0.1" "${DOMAIN:-}"
 
 h "nginx"
-ls -l /etc/nginx/sites-enabled/ 2>&1
-sudo grep -nE 'server_name|listen|ssl_certificate |return 301|managed by Certbot' /etc/nginx/sites-enabled/* 2>&1
+if [[ ${#NGINX_DIRS[@]} -eq 0 ]]; then
+  echo "(no /etc/nginx/sites-enabled or /etc/nginx/conf.d -- is nginx installed?)"
+else
+  ls -l "${NGINX_DIRS[@]}" 2>&1
+  sudo grep -RnE 'server_name|listen|ssl_certificate |return 301|managed by Certbot' "${NGINX_DIRS[@]}" 2>&1
+fi
 sudo nginx -t 2>&1 | tail -2
 
 h "Certificates"

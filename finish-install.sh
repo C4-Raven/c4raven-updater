@@ -22,6 +22,7 @@ WEBROOT="${UI_DEPLOY_DIR:-/var/www/html/raven}"
 
 step() { printf '\n\033[1;34m==>\033[0m %s\n' "$1"; }
 ok() { printf '\033[1;32m    ok:\033[0m %s\n' "$1"; }
+warn() { printf '\033[1;33m  warn:\033[0m %s\n' "$1" >&2; }
 die() { printf '\n\033[1;31mERROR: %s\033[0m\n' "$1" >&2; exit 1; }
 as_app() { sudo -u "$APP_USER" -H bash -lc "cd / && $1"; }
 
@@ -44,6 +45,20 @@ if ! sudo test -f "$WEBROOT/index.html" || [ "${REBUILD_UI:-0}" = 1 ]; then
   sudo install -d -o "$APP_USER" -g "$APP_USER" -m 755 "$WEBROOT"
   sudo rsync -a --no-perms --no-owner --no-group --omit-dir-times --delete "$APP_HOME/c4raven-ui/dist/" "$WEBROOT/"
   sudo chown -R "$APP_USER:$APP_USER" "$WEBROOT"
+  # Relabel for SELinux (Rocky/RHEL, enforcing by default) -- an unlabelled
+  # webroot makes nginx 403 every asset. No-op where restorecon doesn't
+  # exist (Debian/Ubuntu).
+  #
+  # The `|| true` is load-bearing under `set -e`: a failing *last* member of
+  # an && list does abort the script (only earlier members are exempt), so
+  # without it a restorecon that exists but errors would kill this script
+  # here -- right after the UI deploy and before RabbitMQ, the secrets file
+  # and the systemd units, i.e. leaving exactly the half-finished install
+  # this script exists to repair. stderr is deliberately NOT swallowed: a
+  # relabel that really failed should say so.
+  if command -v restorecon >/dev/null 2>&1; then
+    sudo restorecon -R "$WEBROOT" || warn "restorecon failed on $WEBROOT -- if nginx 403s the UI, relabel it by hand."
+  fi
   ok "UI deployed to $WEBROOT"
 else
   ok "already deployed ($WEBROOT/index.html exists; REBUILD_UI=1 to rebuild)"
@@ -83,7 +98,12 @@ step "Writing $APP_HOME/.raven-secrets.env"
 if sudo test -f "$APP_HOME/.raven-secrets.env"; then
   ok "already exists, left as is"
 else
-  DB_URI=$(as_app "python3 -c \"import yaml; print(yaml.safe_load(open('$DATA_DIR/config.yml'))['SQLALCHEMY_DATABASE_URI'])\"")
+  # The venv's interpreter, not the system python3: PyYAML is a dependency of
+  # the backend and is installed into that venv. On Rocky/RHEL /usr/bin/python3
+  # is 3.9 and the EL stack ships python3.12-pyyaml (not python3-pyyaml), so a
+  # bare `python3 -c "import yaml"` dies with ModuleNotFoundError there. The
+  # guard at the top of this script has already proved the venv exists.
+  DB_URI=$(as_app "'$APP_HOME/c4raven-server/.venv/bin/python' -c \"import yaml; print(yaml.safe_load(open('$DATA_DIR/config.yml'))['SQLALCHEMY_DATABASE_URI'])\"")
   case "$DB_URI" in
     postgresql*) ;;
     *) die "config.yml has no PostgreSQL SQLALCHEMY_DATABASE_URI (got '${DB_URI%%:*}...'): install.sh stopped before the database step. Re-run install.sh instead." ;;

@@ -154,7 +154,7 @@ if command -v pg_dump >/dev/null 2>&1; then
     pg_dump "$PG_URI" | gzip > "$BACKUP_DIR/database.sql.gz"
     log "Database backed up to $BACKUP_DIR/database.sql.gz"
 else
-    warn "pg_dump not found on PATH -- skipping database backup. Install postgresql-client or back up manually before proceeding."
+    warn "pg_dump not found on PATH -- skipping database backup. Install it (Debian/Ubuntu: postgresql-client, Rocky/RHEL: postgresql) or back up manually before proceeding."
 fi
 
 # ---- back up the data directory (config, certs, uploads, icons) ------------
@@ -248,6 +248,14 @@ if [[ "$SKIP_UI" != "1" ]]; then
         "$UI_SRC_DIR/dist/" "$UI_DEPLOY_DIR/" || die "UI deploy to $UI_DEPLOY_DIR failed (rsync exit $?)"
     if [[ "$LAYOUT" == raven ]]; then
         sudo chown -R "$RAVEN_USER:$RAVEN_USER" "$UI_DEPLOY_DIR"
+    fi
+    # SELinux (Rocky/RHEL, enforcing by default) labels files by the type
+    # rule for the path they're created under. rsync into a webroot that
+    # isn't the distro default gets that wrong often enough that nginx then
+    # 403s every asset, so relabel from the policy. No-op where SELinux
+    # isn't in use (restorecon doesn't exist on Debian/Ubuntu).
+    if command -v restorecon >/dev/null 2>&1; then
+        sudo restorecon -R "$UI_DEPLOY_DIR" >/dev/null 2>&1 || true
     fi
 else
     warn "SKIP_UI=1 -- frontend left untouched"
