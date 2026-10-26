@@ -82,6 +82,21 @@ auth_http.vhost_path    = http://127.0.0.1:8081/api/rabbitmq/vhost
 auth_http.resource_path = http://127.0.0.1:8081/api/rabbitmq/resource
 auth_http.topic_path    = http://127.0.0.1:8081/api/rabbitmq/topic
 EOF
+# RabbitMQ 4.x (EL always gets it from rabbitmq.com) refuses the transient
+# non-exclusive queues cot_parser and eud_handler declare ("541 ...
+# transient_nonexcl_queues is deprecated"), so re-permit them -- only on 4+,
+# because 3.x refuses to start on a key it has no schema for. Same as
+# c4raven-server-setup's install.sh.
+if command -v dpkg-query >/dev/null 2>&1; then
+  RABBIT_PKG_VERSION=$(dpkg-query -W -f='${Version}' rabbitmq-server 2>/dev/null || true)
+else
+  RABBIT_PKG_VERSION=$(rpm -q --qf '%{VERSION}' rabbitmq-server 2>/dev/null || true)
+fi
+RABBIT_MAJOR=$(printf '%s' "${RABBIT_PKG_VERSION#*:}" | cut -d. -f1)
+case "$RABBIT_MAJOR" in ''|*[!0-9]*) RABBIT_MAJOR=0 ;; esac
+if [ "$RABBIT_MAJOR" -ge 4 ]; then
+  echo "deprecated_features.permit.transient_nonexcl_queues = true" | sudo tee -a /etc/rabbitmq/rabbitmq.conf >/dev/null
+fi
 if ! sudo systemctl restart rabbitmq-server; then
   sudo journalctl -u rabbitmq-server -n 40 --no-pager
   die "RabbitMQ would not start (log above)."
