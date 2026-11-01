@@ -1,77 +1,364 @@
 #!/usr/bin/env bash
-# Finishes a C4 Raven install that c4raven-server-setup's install.sh left
-# half done -- the symptom is "Unit raven.service not found" and a web UI
-# nobody can log in to, because the backend was never started.
+# Completes a C4 Raven install (the `raven` layout from c4raven-server-setup's
+# install.sh, online .deb or .rpm) that stopped partway the first time.
 #
 #   ./finish-install.sh
 #
-# install.sh stops at the first failing command, and everything after the
-# UI build (RabbitMQ setup, the secrets file, the raven / eud_handler /
-# cot_parser units, starting them) is skipped. This redoes exactly those
-# steps, idempotently, checking each one and printing the real error if it
-# fails. It never touches the database contents, config.yml, certificates,
-# or nginx.
+# install.sh stops at the first failing command, so a failure anywhere leaves
+# everything after it undone -- typically "Unit raven.service not found" and a
+# web UI nobody can log in to. This script checks every piece in install
+# order and repairs only what is missing or broken:
 #
-# Run it as your own sudo-capable user (not root, not `raven`).
+#   backend checkout + venv, config.yml, PostgreSQL role/database/grants and
+#   the URI in config.yml, migrations to head, the
+#   certificate authority and server certificate, MediaMTX (binary, config,
+#   webhook token, unit), nginx sites/streams (+ current hardening), the web
+#   UI, RabbitMQ plugins/config, the secrets file, the systemd units, starting
+#   everything, the first administrator account, and a test login.
+#
+# Idempotent: on a complete install it changes nothing (apart from restarting
+# services that are not running). It never drops or empties the database,
+# never regenerates an existing CA or config.yml, and never overwrites an
+# existing nginx site except for the in-place hardening fixes.
+#
+# Run it as your own sudo-capable user, or as root (e.g. in a container).
 set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+. "$HERE/lib/common.sh"
 
 APP_USER="${RAVEN_USER:-raven}"
 APP_HOME="${RAVEN_HOME:-/opt/raven}"
-DATA_DIR="$APP_HOME/data"
+DATA_DIR="${RAVEN_DATA_DIR:-$APP_HOME/data}"
+DB_NAME="${RAVEN_DB_NAME:-raven}"
 WEBROOT="${UI_DEPLOY_DIR:-/var/www/html/raven}"
+SERVER_REPO="${SERVER_REPO:-https://github.com/C4-Raven/c4raven-server.git}"
+UI_REPO="${UI_REPO:-https://github.com/C4-Raven/c4raven-ui.git}"
+# SETUP_REPO_RAW (lib/common.sh): where the installer's templates come from.
+PG_SERVICE="${PG_SERVICE:-postgresql}"
+RABBIT_SERVICE="${RABBIT_SERVICE:-rabbitmq-server}"
 
-step() { printf '\n\033[1;34m==>\033[0m %s\n' "$1"; }
-ok() { printf '\033[1;32m    ok:\033[0m %s\n' "$1"; }
-warn() { printf '\033[1;33m  warn:\033[0m %s\n' "$1" >&2; }
-die() { printf '\n\033[1;31mERROR: %s\033[0m\n' "$1" >&2; exit 1; }
-as_app() { sudo -u "$APP_USER" -H bash -lc "cd / && $1"; }
-
-[ "$(id -u)" != 0 ] || die "Run this as your own sudo-capable user, not root."
-sudo test -d "$APP_HOME/c4raven-server/.venv" \
-  || die "$APP_HOME/c4raven-server/.venv not found: install.sh didn't get as far as the backend. Re-run install.sh instead."
-sudo test -f "$DATA_DIR/config.yml" || die "$DATA_DIR/config.yml not found. Re-run install.sh instead."
-
-# ---- 1. UI ------------------------------------------------------------------
-step "Building and deploying the web UI"
-if ! sudo test -f "$WEBROOT/index.html" || [ "${REBUILD_UI:-0}" = 1 ]; then
-  as_app "cd '$APP_HOME/c4raven-ui' && git checkout -- src/_versions.ts yarn.lock 2>/dev/null; git pull --ff-only origin main" \
-    || die "Could not update $APP_HOME/c4raven-ui from GitHub."
-  # COREPACK_ENABLE_DOWNLOAD_PROMPT=0: never stop to ask before fetching the
-  # pinned yarn. The build (tsc + vite) needs roughly 2 GB of memory.
-  if ! as_app "cd '$APP_HOME/c4raven-ui' && export COREPACK_ENABLE_DOWNLOAD_PROMPT=0 && corepack yarn install --immutable && corepack yarn build"; then
-    free -h
-    die "The UI build failed (output above). If it was killed, the machine is short of memory: add swap (sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile) and re-run."
-  fi
-  sudo install -d -o "$APP_USER" -g "$APP_USER" -m 755 "$WEBROOT"
-  sudo rsync -a --no-perms --no-owner --no-group --omit-dir-times --delete "$APP_HOME/c4raven-ui/dist/" "$WEBROOT/"
-  sudo chown -R "$APP_USER:$APP_USER" "$WEBROOT"
-  # Relabel for SELinux (Rocky/RHEL, enforcing by default) -- an unlabelled
-  # webroot makes nginx 403 every asset. No-op where restorecon doesn't
-  # exist (Debian/Ubuntu).
-  #
-  # The `|| true` is load-bearing under `set -e`: a failing *last* member of
-  # an && list does abort the script (only earlier members are exempt), so
-  # without it a restorecon that exists but errors would kill this script
-  # here -- right after the UI deploy and before RabbitMQ, the secrets file
-  # and the systemd units, i.e. leaving exactly the half-finished install
-  # this script exists to repair. stderr is deliberately NOT swallowed: a
-  # relabel that really failed should say so.
-  if command -v restorecon >/dev/null 2>&1; then
-    sudo restorecon -R "$WEBROOT" || warn "restorecon failed on $WEBROOT -- if nginx 403s the UI, relabel it by hand."
-  fi
-  ok "UI deployed to $WEBROOT"
-else
-  ok "already deployed ($WEBROOT/index.html exists; REBUILD_UI=1 to rebuild)"
+if [[ "$(id -un)" == "$APP_USER" ]]; then
+  die "Run this as your own sudo-capable user (or root), not as '$APP_USER'."
+fi
+if [[ -z "${RAVEN_UPDATER_LOCKED:-}" ]] && command -v flock >/dev/null 2>&1; then
+  exec 9>"${TMPDIR:-/tmp}/c4raven-updater.lock"
+  flock -n 9 || die "Another update.sh / finish-install.sh is already running."
+  export RAVEN_UPDATER_LOCKED=1
 fi
 
-# ---- 2. RabbitMQ ------------------------------------------------------------
-# The plugins have to be enabled BEFORE rabbitmq.conf mentions their settings
-# (mqtt.*, auth_http.*): RabbitMQ refuses to start on settings it has no
-# schema for, and install.sh restarted it with the config first.
-step "Configuring RabbitMQ"
-sudo rabbitmq-plugins enable --offline rabbitmq_mqtt rabbitmq_auth_backend_http >/dev/null \
+as_app() { as_user "$APP_USER" "$@"; }
+as_app_sh() { as_user_sh "$APP_USER" "$1"; }
+q() { printf '%q' "$1"; }
+fetch() {  # fetch RELPATH DEST  (from the setup repo, with retries)
+  # Download as the invoking user, then install as root: root may not write
+  # into another user's file in sticky /tmp (fs.protected_regular).
+  local t rc=0
+  t="$(mktemp)"
+  retry curl -fsSL "$SETUP_REPO_RAW/$1" -o "$t" || rc=$?
+  [[ "$rc" == 0 ]] && { as_root install -m 644 "$t" "$2" || rc=$?; }
+  rm -f "$t"
+  return "$rc"
+}
+
+systemd_notice
+
+# Which backend layout: install.sh / online package = Poetry venv in the
+# checkout; offline package = plain venv behind /opt/raven/venv.
+if as_root test -L "$APP_HOME/venv"; then
+  BACKEND=offline
+  VENV="$APP_HOME/venv"
+  WORKDIR="$DATA_DIR"
+else
+  BACKEND=source
+  VENV="$APP_HOME/c4raven-server/.venv"
+  WORKDIR="$APP_HOME/c4raven-server"
+fi
+PY="$VENV/bin/python"
+CFG="$DATA_DIR/config.yml"
+
+# ---- 0. prerequisites ---------------------------------------------------------
+log "Checking prerequisites"
+missing=()
+for c in psql nginx git curl rsync openssl; do
+  command -v "$c" >/dev/null 2>&1 || as_root test -x "/usr/sbin/$c" || missing+=("$c")
+done
+command -v rabbitmq-plugins >/dev/null 2>&1 || as_root test -x /usr/sbin/rabbitmq-plugins || missing+=("rabbitmq-server")
+if [[ "${#missing[@]}" -gt 0 ]]; then
+  die "Missing system packages: ${missing[*]}. install.sh never got past installing packages; re-run install.sh (it is safe to re-run)."
+fi
+if ! id "$APP_USER" >/dev/null 2>&1; then
+  as_root useradd --system --create-home --home-dir "$APP_HOME" --shell /bin/bash "$APP_USER"
+  as_root chmod 750 "$APP_HOME"
+  fixed "created the $APP_USER system user"
+fi
+as_app mkdir -p "$DATA_DIR/logs"
+ok "packages and the $APP_USER account are present"
+
+# ---- 1. backend ------------------------------------------------------------------
+log "Backend"
+if [[ "$BACKEND" == source ]]; then
+  if ! as_root test -d "$APP_HOME/c4raven-server/.git"; then
+    as_root rm -rf "$APP_HOME/c4raven-server"   # a clone that died halfway
+    retry as_app git clone "$SERVER_REPO" "$APP_HOME/c4raven-server" || die "Could not clone $SERVER_REPO (network?)."
+    fixed "cloned c4raven-server"
+  fi
+  if ! as_app test -x "$APP_HOME/.local/bin/poetry"; then
+    PYBIN=python3
+    [[ "$DISTRO_FAMILY" == rhel ]] && PYBIN=python3.12
+    retry as_app_sh "curl -sSL https://install.python-poetry.org | $PYBIN -" || die "Could not install Poetry (network?)."
+    fixed "installed Poetry for $APP_USER"
+  fi
+  if ! as_app test -x "$VENV/bin/raven" || ! as_app "$PY" -c 'import raven.app' >/dev/null 2>&1; then
+    as_app_sh "poetry config virtualenvs.in-project true"
+    [[ "$DISTRO_FAMILY" == rhel ]] && as_app_sh "cd $(q "$WORKDIR") && poetry env use \$(command -v python3.12)"
+    retry as_app_sh "cd $(q "$WORKDIR") && poetry install --no-interaction" || die "poetry install failed (output above)."
+    as_app git -C "$WORKDIR" checkout -- raven/__init__.py 2>/dev/null || true
+    fixed "backend dependencies installed"
+  else
+    ok "backend venv is complete"
+  fi
+else
+  as_app test -x "$VENV/bin/raven" || die "$VENV is incomplete: finish the offline package with: sudo dpkg --configure -a (or reinstall the offline bundle)."
+  ok "offline package venv present"
+fi
+
+# The app's CLI logs to logs/raven.log: a copy systemd created as root makes
+# every flask command below die with PermissionError.
+fix_log_ownership "$APP_USER" "$DATA_DIR/logs" raven.log || true
+
+if ! as_app test -f "$CFG"; then
+  flask_cmd "$APP_USER" "$VENV" "$DATA_DIR" "$WORKDIR" raven generate-config
+  fixed "generated config.yml"
+else
+  ok "config.yml present"
+fi
+
+# ---- 2. PostgreSQL ------------------------------------------------------------------
+log "PostgreSQL"
+if [[ "$HAS_SYSTEMD" == 1 ]]; then
+  if [[ "$DISTRO_FAMILY" == rhel ]] && ! as_root test -f /var/lib/pgsql/data/PG_VERSION; then
+    as_root postgresql-setup --initdb && fixed "initialised the PostgreSQL cluster"
+  fi
+  unit_active "$PG_SERVICE" || { as_root systemctl enable --now "$PG_SERVICE" && fixed "started $PG_SERVICE"; }
+fi
+for i in $(seq 1 15); do as_postgres "psql -XtAc 'select 1'" >/dev/null 2>&1 && break; sleep 2; done
+as_postgres "psql -XtAc 'select 1'" >/dev/null 2>&1 || die "PostgreSQL isn't accepting connections. Start it (sudo systemctl start $PG_SERVICE, or pg_ctlcluster in a container) and re-run."
+
+URI="$(config_get "$PY" "$CFG" "$APP_USER" SQLALCHEMY_DATABASE_URI)"
+role_exists="$(as_postgres "psql -XtAc \"SELECT 1 FROM pg_roles WHERE rolname='$DB_NAME'\"")"
+db_password=""
+case "$URI" in
+  postgresql*://"$DB_NAME":*@*) db_password="${URI#*://"$DB_NAME":}"; db_password="${db_password%@*}" ;;
+esac
+if [[ -z "$db_password" ]]; then
+  # Hex only: it goes raw into a URI (same as install.sh).
+  db_password="$(openssl rand -hex 16)"
+  URI="postgresql+psycopg://$DB_NAME:$db_password@127.0.0.1/$DB_NAME"
+  config_set "$PY" "$CFG" "$APP_USER" SQLALCHEMY_DATABASE_URI "$URI"
+  fixed "config.yml now points at the PostgreSQL database"
+fi
+if [[ "$role_exists" != 1 ]]; then
+  as_postgres "psql -Xqc \"CREATE ROLE $DB_NAME WITH LOGIN PASSWORD '$db_password';\""
+  fixed "created database role $DB_NAME"
+elif ! PGPASSWORD="$db_password" psql -XtAq -h 127.0.0.1 -U "$DB_NAME" -d postgres -c 'select 1' >/dev/null 2>&1; then
+  # The role exists but config.yml's password doesn't work (install died
+  # between the two). Make the role match config.yml, not the other way
+  # round: config.yml is what the app and the secrets file use.
+  as_postgres "psql -Xqc \"ALTER ROLE $DB_NAME WITH LOGIN PASSWORD '$db_password';\""
+  fixed "reset role $DB_NAME's password to the one in config.yml"
+fi
+if [[ "$(as_postgres "psql -XtAc \"SELECT 1 FROM pg_database WHERE datname='$DB_NAME'\"")" != 1 ]]; then
+  as_postgres "psql -Xqc 'CREATE DATABASE $DB_NAME;'"
+  fixed "created database $DB_NAME"
+fi
+as_postgres "psql -Xqc 'GRANT ALL PRIVILEGES ON DATABASE \"$DB_NAME\" TO $DB_NAME;'" >/dev/null
+as_postgres "psql -Xq -d $DB_NAME -c 'GRANT ALL ON SCHEMA public TO $DB_NAME;'" >/dev/null
+as_postgres "psql -Xq -d $DB_NAME -c 'CREATE EXTENSION IF NOT EXISTS postgis'" >/dev/null 2>&1 || true
+PGPASSWORD="$db_password" psql -XtAq -h 127.0.0.1 -U "$DB_NAME" -d "$DB_NAME" -c 'select 1' >/dev/null 2>&1 \
+  || die "The app's database credentials still don't work against 127.0.0.1 (check pg_hba.conf allows md5/scram for 127.0.0.1)."
+ok "role, database and grants in place; config.yml's credentials work"
+
+log "Database schema"
+db_migrate "$APP_USER" "$VENV" "$DATA_DIR" "$WORKDIR" || die "Migrations failed (output above)."
+
+log "config.yml settings"
+if out=$(config_add_keys "$PY" "$CFG" "$APP_USER" "$APP_HOME/.raven-secrets.env"); then
+  if [[ -n "$out" ]]; then fixed "config.yml: added $(echo "$out" | tr '\n' ' ')"; else ok "config.yml left as it is"; fi
+fi
+
+# ---- 3. certificate authority ----------------------------------------------------------
+log "Certificate authority"
+if ! as_app test -s "$DATA_DIR/ca/ca.pem"; then
+  flask_cmd "$APP_USER" "$VENV" "$DATA_DIR" "$WORKDIR" raven create-ca
+  fixed "created the certificate authority"
+fi
+if ! as_app test -s "$DATA_DIR/ca/certs/raven/raven.pem" || ! as_app test -s "$DATA_DIR/ca/certs/raven/raven.nopass.key"; then
+  flask_cmd "$APP_USER" "$VENV" "$DATA_DIR" "$WORKDIR" raven issue-server-certificate
+  fixed "issued the server certificate"
+fi
+ok "CA and server certificate present"
+if command -v restorecon >/dev/null 2>&1; then as_root restorecon -R "$DATA_DIR/ca" >/dev/null 2>&1 || true; fi
+
+# ---- 4. MediaMTX ------------------------------------------------------------------------
+log "MediaMTX"
+MTX_DIR="$DATA_DIR/mediamtx"
+as_app mkdir -p "$MTX_DIR/recordings"
+if ! as_app test -x "$MTX_DIR/mediamtx"; then
+  case "$(uname -m)" in
+    x86_64) MTX_ARCH=amd64 ;; aarch64|arm64) MTX_ARCH=arm64 ;; armv7l|armv8l) MTX_ARCH=armv7 ;; *) MTX_ARCH="" ;;
+  esac
+  if [[ -n "$MTX_ARCH" && "$BACKEND" == source ]]; then
+    if retry as_app_sh "cd $(q "$WORKDIR") && poetry run lastversion --filter '~*linux_$MTX_ARCH' --only 1.13.0 -o $(q "$MTX_DIR/mediamtx.tar.gz") --assets download bluenviron/mediamtx" \
+       && as_app_sh "cd $(q "$MTX_DIR") && tar -xf mediamtx.tar.gz && rm -f mediamtx.tar.gz"; then
+      fixed "downloaded mediamtx"
+    else
+      warn "could not download mediamtx; video streaming won't work until it's in $MTX_DIR"
+    fi
+  else
+    warn "mediamtx binary missing in $MTX_DIR"
+  fi
+fi
+if ! as_app test -f "$MTX_DIR/mediamtx.yml"; then
+  tmp="$(mktemp)"
+  if retry curl -fsSL "$SETUP_REPO_RAW/mediamtx.yml" -o "$tmp"; then
+    host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    sed -i -e "s~OTS_FOLDER~$DATA_DIR~g" \
+           -e "s~SERVER_CERT_FILE~$DATA_DIR/ca/certs/raven/raven.pem~g" \
+           -e "s~SERVER_KEY_FILE~$DATA_DIR/ca/certs/raven/raven.nopass.key~g" \
+           -e "s~^webrtcAdditionalHosts: \[\]~webrtcAdditionalHosts: [${RAVEN_DOMAIN:-$host_ip}]~" "$tmp"
+    as_root install -o "$APP_USER" -g "$APP_USER" -m 644 "$tmp" "$MTX_DIR/mediamtx.yml"
+    fixed "wrote mediamtx.yml"
+  else
+    warn "could not fetch mediamtx.yml from $SETUP_REPO_RAW"
+  fi
+  rm -f "$tmp"
+fi
+if as_root grep -qs MTX_TOKEN "$MTX_DIR/mediamtx.yml"; then
+  tok="$(config_get "$PY" "$CFG" "$APP_USER" RAVEN_MEDIAMTX_TOKEN)"
+  if [[ -n "$tok" ]]; then
+    as_root sed -i "s~MTX_TOKEN~$tok~g" "$MTX_DIR/mediamtx.yml"
+    fixed "filled in MediaMTX's webhook token"
+  else
+    warn "config.yml has no RAVEN_MEDIAMTX_TOKEN; mediamtx.yml still has the placeholder"
+  fi
+fi
+if ! as_root test -f /etc/systemd/system/mediamtx.service; then
+  as_root tee /etc/systemd/system/mediamtx.service >/dev/null <<EOF
+[Unit]
+Wants=network.target
+After=network.target
+[Service]
+User=$APP_USER
+ExecStart=$MTX_DIR/mediamtx $MTX_DIR/mediamtx.yml
+Restart=always
+RestartSec=5s
+[Install]
+WantedBy=multi-user.target
+EOF
+  fixed "wrote mediamtx.service"
+fi
+ok "MediaMTX checked"
+
+# ---- 5. nginx ---------------------------------------------------------------------------
+log "nginx"
+as_root mkdir -p "$NGINX_SITES_DIR" "$NGINX_STREAMS_DIR"
+[[ -n "$NGINX_SITES_ENABLED_DIR" ]] && as_root mkdir -p "$NGINX_SITES_ENABLED_DIR"
+[[ -n "$NGINX_STREAMS_ENABLED_DIR" ]] && as_root mkdir -p "$NGINX_STREAMS_ENABLED_DIR"
+NGINX_CHANGED=0
+if ! as_root grep -q "stream {" "$NGINX_CONF"; then
+  if [[ -n "$NGINX_STREAMS_ENABLED_DIR" ]]; then inc="$NGINX_STREAMS_ENABLED_DIR/*"; else inc="$NGINX_STREAMS_DIR/*$NGINX_CONF_SUFFIX"; fi
+  printf '\nstream {\n        include %s;\n}\n' "$inc" | as_root tee -a "$NGINX_CONF" >/dev/null
+  NGINX_CHANGED=1; fixed "added the stream {} block to $NGINX_CONF"
+fi
+if ! as_root test -f /etc/nginx/proxy_params; then
+  fetch rpm/proxy_params /etc/nginx/proxy_params && { NGINX_CHANGED=1; fixed "added /etc/nginx/proxy_params"; }
+fi
+subst_certs() {
+  as_root sed -i -e "s~SERVER_CERT_FILE~$DATA_DIR/ca/certs/raven/raven.pem~g" \
+                 -e "s~SERVER_KEY_FILE~$DATA_DIR/ca/certs/raven/raven.nopass.key~g" \
+                 -e "s~CA_CERT_FILE~$DATA_DIR/ca/ca.pem~g" "$1"
+}
+for s in raven_http raven_https raven_certificate_enrollment; do
+  f="$(nginx_site_file "$s")"
+  if ! as_root test -f "$f"; then
+    fetch "nginx_configs/$s" "$f" && subst_certs "$f" && { NGINX_CHANGED=1; fixed "restored nginx site $s"; }
+  fi
+  if [[ -n "$NGINX_SITES_ENABLED_DIR" ]] && ! as_root test -e "$NGINX_SITES_ENABLED_DIR/$s"; then
+    as_root ln -sf "$f" "$NGINX_SITES_ENABLED_DIR/"; NGINX_CHANGED=1; fixed "enabled nginx site $s"
+  fi
+done
+for s in rabbitmq mediamtx; do
+  f="$(nginx_stream_file "$s")"
+  if ! as_root test -f "$f"; then
+    fetch "nginx_configs/$s" "$f" && subst_certs "$f" && { NGINX_CHANGED=1; fixed "restored nginx stream $s"; }
+  fi
+  if [[ -n "$NGINX_STREAMS_ENABLED_DIR" ]] && ! as_root test -e "$NGINX_STREAMS_ENABLED_DIR/$s"; then
+    as_root ln -sf "$f" "$NGINX_STREAMS_ENABLED_DIR/"; NGINX_CHANGED=1; fixed "enabled nginx stream $s"
+  fi
+done
+# Debian's welcome page would answer port 80 instead of raven_http.
+[[ -n "$NGINX_SITES_ENABLED_DIR" ]] && as_root test -e "$NGINX_SITES_ENABLED_DIR/default" \
+  && { as_root rm -f "$NGINX_SITES_ENABLED_DIR/default"; NGINX_CHANGED=1; fixed "disabled the distro's default nginx site"; }
+if [[ "$DISTRO_FAMILY" == rhel ]] && command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce)" != Disabled ]]; then
+  as_root setsebool -P httpd_can_network_connect 1 2>/dev/null || true
+fi
+nginx_harden || true
+if as_root nginx -t >/dev/null 2>&1; then
+  if [[ "$HAS_SYSTEMD" == 1 ]]; then
+    as_root systemctl enable nginx >/dev/null 2>&1 || true
+    if ! unit_active nginx; then as_root systemctl restart nginx && fixed "started nginx"
+    elif [[ "$NGINX_CHANGED" == 1 ]]; then as_root systemctl reload nginx; fi
+  elif [[ "$NGINX_CHANGED" == 1 ]]; then
+    nginx_reload
+  fi
+  ok "nginx configuration valid"
+else
+  as_root nginx -t || true
+  warn "nginx -t fails (above). The web UI won't load until that is fixed."
+fi
+
+# ---- 6. web UI ---------------------------------------------------------------------------
+log "Web UI"
+if ! as_root test -f "$WEBROOT/index.html" || [[ "${REBUILD_UI:-0}" == 1 ]]; then
+  if [[ "$BACKEND" == offline ]]; then
+    warn "$WEBROOT/index.html missing on an offline package install: reinstall the bundle (it ships the built UI)"
+  else
+    if ! as_root test -d "$APP_HOME/c4raven-ui/.git"; then
+      as_root rm -rf "$APP_HOME/c4raven-ui"
+      retry as_app git clone "$UI_REPO" "$APP_HOME/c4raven-ui" || die "Could not clone $UI_REPO (network?)."
+    else
+      as_app_sh "cd $APP_HOME/c4raven-ui && git checkout -- src/_versions.ts yarn.lock 2>/dev/null; true"
+      retry as_app_sh "cd $APP_HOME/c4raven-ui && git pull --ff-only origin main" || warn "could not update c4raven-ui; building what is checked out"
+    fi
+    COREPACK="$(command -v corepack || true)"
+    [[ -n "$COREPACK" ]] || die "corepack not found (Node 22 from NodeSource ships it). Re-run install.sh, or: sudo npm install -g corepack"
+    retry as_app_sh "cd $APP_HOME/c4raven-ui && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 $(q "$COREPACK") yarn install --immutable" || die "yarn install failed (output above)."
+    if ! as_app_sh "cd $APP_HOME/c4raven-ui && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 $(q "$COREPACK") yarn build"; then
+      free -h 2>/dev/null || true
+      die "The UI build failed (output above). If it was killed, the machine is short of memory: add 2 GB of swap and re-run."
+    fi
+    as_app git -C "$APP_HOME/c4raven-ui" checkout -- src/_versions.ts 2>/dev/null || true
+    as_root install -d -o "$APP_USER" -g "$APP_USER" -m 755 "$WEBROOT"
+    as_root rsync -a --no-perms --no-owner --no-group --omit-dir-times --delete "$APP_HOME/c4raven-ui/dist/" "$WEBROOT/"
+    as_root chown -R "$APP_USER:$APP_USER" "$WEBROOT"
+    if command -v restorecon >/dev/null 2>&1; then as_root restorecon -R "$WEBROOT" || warn "restorecon failed on $WEBROOT"; fi
+    as_app_sh "git -C $APP_HOME/c4raven-ui rev-parse --short HEAD > $(q "$DATA_DIR/.ui-deployed-commit")" || true
+    fixed "built and deployed the web UI to $WEBROOT"
+  fi
+else
+  ok "web UI deployed ($WEBROOT/index.html; REBUILD_UI=1 to rebuild)"
+fi
+
+# ---- 7. RabbitMQ ---------------------------------------------------------------------------
+# The plugins must be enabled BEFORE rabbitmq.conf names their settings:
+# RabbitMQ refuses to start on settings it has no schema for.
+log "RabbitMQ"
+as_root rabbitmq-plugins enable --offline rabbitmq_mqtt rabbitmq_auth_backend_http >/dev/null \
   || die "rabbitmq-plugins could not enable rabbitmq_mqtt / rabbitmq_auth_backend_http (output above)."
-sudo tee /etc/rabbitmq/rabbitmq.conf >/dev/null << 'EOF'
+want="$(mktemp)"
+cat > "$want" <<'EOF'
 mqtt.listeners.tcp.default = 1883
 
 auth_backends.1 = internal
@@ -82,11 +369,8 @@ auth_http.vhost_path    = http://127.0.0.1:8081/api/rabbitmq/vhost
 auth_http.resource_path = http://127.0.0.1:8081/api/rabbitmq/resource
 auth_http.topic_path    = http://127.0.0.1:8081/api/rabbitmq/topic
 EOF
-# RabbitMQ 4.x (EL always gets it from rabbitmq.com) refuses the transient
-# non-exclusive queues cot_parser and eud_handler declare ("541 ...
-# transient_nonexcl_queues is deprecated"), so re-permit them -- only on 4+,
-# because 3.x refuses to start on a key it has no schema for. Same as
-# c4raven-server-setup's install.sh.
+# RabbitMQ 4.x refuses the transient non-exclusive queues the services
+# declare unless re-permitted; 3.x refuses to start on that key.
 if command -v dpkg-query >/dev/null 2>&1; then
   RABBIT_PKG_VERSION=$(dpkg-query -W -f='${Version}' rabbitmq-server 2>/dev/null || true)
 else
@@ -94,60 +378,91 @@ else
 fi
 RABBIT_MAJOR=$(printf '%s' "${RABBIT_PKG_VERSION#*:}" | cut -d. -f1)
 case "$RABBIT_MAJOR" in ''|*[!0-9]*) RABBIT_MAJOR=0 ;; esac
-if [ "$RABBIT_MAJOR" -ge 4 ]; then
-  echo "deprecated_features.permit.transient_nonexcl_queues = true" | sudo tee -a /etc/rabbitmq/rabbitmq.conf >/dev/null
-fi
-if ! sudo systemctl restart rabbitmq-server; then
-  sudo journalctl -u rabbitmq-server -n 40 --no-pager
-  die "RabbitMQ would not start (log above)."
-fi
-for i in $(seq 1 30); do
-  sudo rabbitmq-diagnostics -q check_port_connectivity >/dev/null 2>&1 && break
-  [ "$i" -eq 30 ] && { sudo journalctl -u rabbitmq-server -n 40 --no-pager; die "RabbitMQ started but isn't accepting connections (log above)."; }
-  sleep 2
+[[ "$RABBIT_MAJOR" -ge 4 ]] && echo "deprecated_features.permit.transient_nonexcl_queues = true" >> "$want"
+RABBIT_RESTART=0
+# Rewrite only when a setting Raven needs is absent, so an admin's own
+# additions to rabbitmq.conf survive.
+need_conf=0
+for k in mqtt.listeners.tcp.default auth_backends.2 auth_http.user_path auth_http.topic_path; do
+  as_root grep -qs "^$k" /etc/rabbitmq/rabbitmq.conf || need_conf=1
 done
-ok "RabbitMQ running with MQTT and HTTP auth"
+[[ "$RABBIT_MAJOR" -ge 4 ]] && ! as_root grep -qs '^deprecated_features.permit.transient_nonexcl_queues' /etc/rabbitmq/rabbitmq.conf && need_conf=1
+if [[ "$need_conf" == 1 ]]; then
+  as_root test -f /etc/rabbitmq/rabbitmq.conf && as_root cp -a /etc/rabbitmq/rabbitmq.conf "/etc/rabbitmq/rabbitmq.conf.bak-$(date +%Y%m%d-%H%M%S)"
+  as_root mkdir -p /etc/rabbitmq
+  as_root install -m 644 "$want" /etc/rabbitmq/rabbitmq.conf
+  RABBIT_RESTART=1; fixed "wrote /etc/rabbitmq/rabbitmq.conf"
+fi
+rm -f "$want"
+if [[ "$HAS_SYSTEMD" == 1 ]]; then
+  as_root systemctl enable "$RABBIT_SERVICE" >/dev/null 2>&1 || true
+  if [[ "$RABBIT_RESTART" == 1 ]] || ! unit_active "$RABBIT_SERVICE"; then
+    if ! as_root systemctl restart "$RABBIT_SERVICE"; then
+      as_root journalctl -u "$RABBIT_SERVICE" -n 40 --no-pager || true
+      die "RabbitMQ would not start (log above)."
+    fi
+    for i in $(seq 1 30); do
+      as_root rabbitmq-diagnostics -q check_port_connectivity >/dev/null 2>&1 && break
+      [[ "$i" -eq 30 ]] && { as_root journalctl -u "$RABBIT_SERVICE" -n 40 --no-pager || true; die "RabbitMQ started but isn't accepting connections (log above)."; }
+      sleep 2
+    done
+    fixed "(re)started RabbitMQ"
+  fi
+elif [[ "$RABBIT_RESTART" == 1 ]]; then
+  MANUAL_RESTARTS+=("$RABBIT_SERVICE")
+fi
+ok "RabbitMQ has MQTT and HTTP auth configured"
 
-# ---- 3. secrets file --------------------------------------------------------
-step "Writing $APP_HOME/.raven-secrets.env"
-if sudo test -f "$APP_HOME/.raven-secrets.env"; then
-  ok "already exists, left as is"
-else
-  # The venv's interpreter, not the system python3: PyYAML is a dependency of
-  # the backend and is installed into that venv. On Rocky/RHEL /usr/bin/python3
-  # is 3.9 and the EL stack ships python3.12-pyyaml (not python3-pyyaml), so a
-  # bare `python3 -c "import yaml"` dies with ModuleNotFoundError there. The
-  # guard at the top of this script has already proved the venv exists.
-  DB_URI=$(as_app "'$APP_HOME/c4raven-server/.venv/bin/python' -c \"import yaml; print(yaml.safe_load(open('$DATA_DIR/config.yml'))['SQLALCHEMY_DATABASE_URI'])\"")
-  case "$DB_URI" in
-    postgresql*) ;;
-    *) die "config.yml has no PostgreSQL SQLALCHEMY_DATABASE_URI (got '${DB_URI%%:*}...'): install.sh stopped before the database step. Re-run install.sh instead." ;;
-  esac
-  sudo tee "$APP_HOME/.raven-secrets.env" >/dev/null << EOF
+# ---- 8. secrets file -------------------------------------------------------------------------
+log "Secrets file"
+SECRETS="$APP_HOME/.raven-secrets.env"
+if ! as_root test -f "$SECRETS"; then
+  as_root tee "$SECRETS" >/dev/null <<EOF
 RAVEN_DATA_FOLDER=$DATA_DIR
-SQLALCHEMY_DATABASE_URI=$DB_URI
+SQLALCHEMY_DATABASE_URI=$URI
 RAVEN_RABBITMQ_USERNAME=guest
 RAVEN_RABBITMQ_PASSWORD=guest
 RAVEN_FEDHUB_ENABLE=False
 RAVEN_MEDIAMTX_ENABLE=True
 EOF
-  sudo chown "$APP_USER:$APP_USER" "$APP_HOME/.raven-secrets.env"
-  sudo chmod 600 "$APP_HOME/.raven-secrets.env"
-  ok "written"
+  fixed "wrote $SECRETS"
+elif ! as_root grep -qxF "SQLALCHEMY_DATABASE_URI=$URI" "$SECRETS"; then
+  # The env file wins over nothing (config.yml is loaded after it), but keep
+  # the two from disagreeing.
+  as_root sed -i "s~^SQLALCHEMY_DATABASE_URI=.*~SQLALCHEMY_DATABASE_URI=$URI~" "$SECRETS"
+  as_root grep -q '^SQLALCHEMY_DATABASE_URI=' "$SECRETS" || echo "SQLALCHEMY_DATABASE_URI=$URI" | as_root tee -a "$SECRETS" >/dev/null
+  fixed "brought the database URI in $SECRETS in line with config.yml"
+else
+  ok "present and consistent with config.yml"
 fi
+as_root chown "$APP_USER:$APP_USER" "$SECRETS"
+as_root chmod 600 "$SECRETS"
 
-# ---- 4. systemd units (same as install.sh writes) ---------------------------
-step "Installing the raven, eud_handler, eud_handler_ssl and cot_parser services"
-sudo tee /etc/systemd/system/raven.service >/dev/null << EOF
+# ---- 9. systemd units -------------------------------------------------------------------------
+log "Raven services"
+if [[ "$BACKEND" == source ]]; then BIN_DIR="$APP_HOME/c4raven-server/.venv/bin"; else BIN_DIR="$APP_HOME/venv/bin"; fi
+UNITS_CHANGED=0
+write_unit() {  # write_unit NAME  (content on stdin), only if it doesn't exist
+  local tmp; tmp="$(mktemp)"; cat > "$tmp"
+  # An existing unit anywhere (install.sh's in /etc, the .deb/.rpm's in
+  # /lib or /usr/lib, or an admin's edit) is kept as it is: only fill in
+  # what's missing, and never shadow a packaged unit with an /etc copy.
+  if ! unit_exists "$1.service"; then
+    as_root install -m 644 "$tmp" "/etc/systemd/system/$1.service"
+    UNITS_CHANGED=1; fixed "wrote $1.service"
+  fi
+  rm -f "$tmp"
+}
+write_unit raven <<EOF
 [Unit]
-Wants=network.target rabbitmq-server.service postgresql.service
-After=network.target rabbitmq-server.service postgresql.service
+Wants=network.target $RABBIT_SERVICE.service $PG_SERVICE.service
+After=network.target $RABBIT_SERVICE.service $PG_SERVICE.service
 Requires=eud_handler.service eud_handler_ssl.service cot_parser.service
 [Service]
 User=$APP_USER
-WorkingDirectory=$APP_HOME/c4raven-server
-EnvironmentFile=$APP_HOME/.raven-secrets.env
-ExecStart=$APP_HOME/c4raven-server/.venv/bin/raven
+WorkingDirectory=$WORKDIR
+EnvironmentFile=$SECRETS
+ExecStart=$BIN_DIR/raven
 Restart=always
 RestartSec=5s
 StandardOutput=append:$DATA_DIR/logs/raven.log
@@ -155,20 +470,18 @@ StandardError=append:$DATA_DIR/logs/raven.log
 [Install]
 WantedBy=multi-user.target
 EOF
-for svc in cot_parser eud_handler eud_handler_ssl; do
-  EXTRA_ARGS=""
-  [ "$svc" = "eud_handler_ssl" ] && EXTRA_ARGS=" --ssl"
-  BIN="${svc%_ssl}"
-  sudo tee "/etc/systemd/system/${svc}.service" >/dev/null << EOF
+for s in cot_parser eud_handler eud_handler_ssl; do
+  extra=""; [[ "$s" == eud_handler_ssl ]] && extra=" --ssl"
+  write_unit "$s" <<EOF
 [Unit]
-Wants=network.target rabbitmq-server.service
-After=network.target rabbitmq-server.service
+Wants=network.target $RABBIT_SERVICE.service
+After=network.target $RABBIT_SERVICE.service
 PartOf=raven.service
 [Service]
 User=$APP_USER
-WorkingDirectory=$APP_HOME/c4raven-server
-EnvironmentFile=$APP_HOME/.raven-secrets.env
-ExecStart=$APP_HOME/c4raven-server/.venv/bin/${BIN}${EXTRA_ARGS}
+WorkingDirectory=$WORKDIR
+EnvironmentFile=$SECRETS
+ExecStart=$BIN_DIR/${s%_ssl}$extra
 Restart=always
 RestartSec=5s
 StandardOutput=append:$DATA_DIR/logs/raven.log
@@ -177,32 +490,60 @@ StandardError=append:$DATA_DIR/logs/raven.log
 WantedBy=multi-user.target
 EOF
 done
-as_app "mkdir -p '$DATA_DIR/logs'"
-sudo systemctl daemon-reload
-sudo systemctl enable mediamtx raven cot_parser eud_handler eud_handler_ssl >/dev/null 2>&1
-ok "installed and enabled"
-
-# ---- 5. start and wait ------------------------------------------------------
-step "Starting the services"
-sudo systemctl restart mediamtx raven cot_parser eud_handler eud_handler_ssl || true
-echo "    waiting for the backend (the first start creates the database tables)..."
-for i in $(seq 1 90); do
-  curl -fsS -o /dev/null http://127.0.0.1:8081/api/health 2>/dev/null && break
-  if [ "$i" -eq 90 ]; then
-    for s in raven cot_parser eud_handler eud_handler_ssl mediamtx; do printf '    %-16s %s\n' "$s" "$(systemctl is-active $s)"; done
-    sudo tail -n 60 "$DATA_DIR/logs/raven.log" 2>/dev/null | grep -v after_fork
-    die "The backend didn't answer on 127.0.0.1:8081 after 3 minutes (status and log above)."
+fix_log_ownership "$APP_USER" "$DATA_DIR/logs" raven.log || true
+SERVICES="mediamtx raven cot_parser eud_handler eud_handler_ssl"
+if [[ "$HAS_SYSTEMD" == 1 ]]; then
+  as_root systemctl daemon-reload
+  for s in $SERVICES; do
+    systemctl is-enabled --quiet "$s" 2>/dev/null || { as_root systemctl enable "$s" >/dev/null 2>&1 && fixed "enabled $s"; }
+  done
+  not_running=""
+  for s in $SERVICES; do unit_active "$s" || not_running="$not_running $s"; done
+  if [[ "$UNITS_CHANGED" == 1 || -n "$not_running" ]]; then
+    # shellcheck disable=SC2086
+    as_root systemctl restart $SERVICES || true
+    fixed "started:${not_running:- $SERVICES}"
+  else
+    ok "all Raven services enabled and running"
   fi
-  sleep 2
-done
-ok "backend answering on 127.0.0.1:8081"
-for s in raven cot_parser eud_handler eud_handler_ssl mediamtx nginx rabbitmq-server postgresql; do
-  printf '    %-16s %s\n' "$s" "$(systemctl is-active $s)"
-done
+else
+  # shellcheck disable=SC2206
+  MANUAL_RESTARTS+=($SERVICES)
+fi
 
-# ---- 6. prove a login works --------------------------------------------------
-step "Testing a login as administrator"
-RESULT=$(python3 - << 'EOF'
+# ---- 10. wait for the backend --------------------------------------------------------------------
+BACKEND_UP=0
+if [[ "$HAS_SYSTEMD" == 1 ]] || curl -s -o /dev/null --max-time 3 http://127.0.0.1:8081/api/health; then
+  log "Waiting for the backend on 127.0.0.1:8081"
+  if wait_healthy http://127.0.0.1:8081/api/health 90; then
+    BACKEND_UP=1; ok "backend answering"
+  else
+    for s in $SERVICES; do printf '    %-16s %s\n' "$s" "$(unit_state "$s")"; done
+    as_root tail -n 60 "$DATA_DIR/logs/raven.log" 2>/dev/null | grep -v after_fork || true
+    warn "the backend didn't answer on 127.0.0.1:8081 within 3 minutes (status and log above)"
+  fi
+fi
+
+# ---- 11. first administrator -------------------------------------------------------------------------
+if [[ "$BACKEND_UP" == 1 ]]; then
+  log "First administrator account"
+  seed="$(mktemp)"
+  if retry curl -fsSL "$SETUP_REPO_RAW/seed_admin.py" -o "$seed"; then
+    as_root install -o "$APP_USER" -g "$APP_USER" -m 644 "$seed" "$APP_HOME/seed_admin.py"
+    rc=0
+    as_app_sh "cd $(q "$WORKDIR") && RAVEN_DATA_FOLDER=$(q "$DATA_DIR") $(q "$PY") $(q "$APP_HOME/seed_admin.py")" || rc=$?
+    case "$rc" in
+      0) fixed "administrator account ready (must set a new password at first login)" ;;
+      3) ok "accounts already exist; left untouched" ;;
+      *) warn "seed_admin.py exited $rc" ;;
+    esac
+  else
+    warn "could not fetch seed_admin.py from $SETUP_REPO_RAW"
+  fi
+  rm -f "$seed"
+
+  log "Testing a login as administrator"
+  RESULT=$(python3 - <<'EOF'
 import http.cookiejar, json, urllib.request, urllib.error
 jar = http.cookiejar.CookieJar()
 op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
@@ -224,16 +565,20 @@ if s == 200:
 else:
     print(f"failed ({s}): {r.get('errors') or r.get('field_errors') or d}")
 EOF
-)
-case "$RESULT" in
-  ok*) ok "administrator / password logs in $RESULT" ;;
-  *)   echo "    administrator / password: $RESULT"
-       echo "    (expected if the password was already changed; log in with the new one)" ;;
-esac
+) || RESULT="could not run the login test"
+  case "$RESULT" in
+    ok*) ok "administrator / password logs in $RESULT" ;;
+    *)   echo "    administrator / password: $RESULT"
+         echo "    (expected if the password was already changed; log in with the new one)" ;;
+  esac
+fi
 
-cat << EOF
+echo
+echo "finish-install.sh done."
+print_summary
+cat <<EOF
 
-Done. Open https://<your domain or this server's IP> and log in as
-'administrator' (password 'password' unless it has been changed). Set a real
-password straight away under your account settings.
+Open https://<your domain or this server's IP> and log in as 'administrator'
+(password 'password' unless it has been changed), then set a real password.
 EOF
+[[ "$BACKEND_UP" == 1 || "$HAS_SYSTEMD" == 0 ]]
