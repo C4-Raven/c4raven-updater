@@ -17,53 +17,102 @@ that separate, deliberate task.
 
 ## What this does
 
-1. Backs up your database, your data directory (config, certificates,
-   uploads, icons), and the currently-deployed UI to a timestamped folder
-   under `~/backups/`.
-2. Fast-forwards `c4raven-server` to its `origin/main` and reinstalls
-   it into the venv (no separate patch step, the customizations are just
-   part of the fork's commit history).
-3. Fast-forwards `c4raven-ui` to its `origin/main`, builds it, and
-   deploys it.
-4. Restarts the backend services (they all run from the same backend
-   install) and waits for the health check.
+`./update.sh` brings an existing install fully up to date and is safe to
+re-run (a second run changes nothing):
 
-It works on both server layouts and picks the right one by itself:
+1. **Backs up** the database (`pg_dump`), the data directory (config,
+   certificates, uploads, icons), the deployed UI and `/etc/nginx` to a
+   timestamped folder under `~/backups/`. If the database dump fails,
+   it stops before changing anything.
+2. **Backend**: fast-forwards `c4raven-server` to `origin/main` and installs
+   its Python dependencies (`poetry install` on the `raven` layout,
+   `pip install -e` on the legacy one).
+3. **Frontend**: fast-forwards `c4raven-ui`, and if that commit isn't the
+   one already deployed, builds it (`corepack yarn install --immutable &&
+   corepack yarn build`) and deploys it.
+4. **Database**: stops the Raven services, runs `flask db upgrade` to the
+   newest migration, then checks that the database revision equals the
+   code's head.
+5. **config.yml** is left alone. Settings added in a release
+   (`RAVEN_CONNECTION_PROFILE_REQUIRE_AUTH` in 2.3.0) take the code's default
+   while `config.yml` doesn't have them. Writing them in would also override
+   an environment variable of the same name, which config.yml takes
+   precedence over. New scheduled jobs (`expire_group_memberships`) are added
+   by the server itself when it starts, and the updater checks that they're
+   registered. A `mediamtx.yml` that still has the `MTX_TOKEN` placeholder
+   gets the real token. The log files in `logs/` are made to belong to the
+   service user, because the 2.3.0 error-log viewer reads them.
+6. **nginx**: applies the current template fixes to the site files already
+   on the server, in place, for both the `raven_*` and the legacy `ots_*`
+   names:
+   - `proxy_set_header X-Ssl-Cert "";` in every location that proxies to the
+     backend in the blocks that don't verify a client certificate
+     (`raven_http`, `raven_certificate_enrollment`,
+     `raven_certificate_enrollment_domain`, including certbot's 443 block in
+     `raven_http`; `ots_http`, `ots_certificate_enrollment*` on the legacy
+     box). Without it a client could send its own `X-Ssl-Cert` header over
+     plain HTTP and be taken for any certificate holder. This uses
+     c4raven-server-setup's own `lib/nginx_clear_ssl_cert.py`, fetched from
+     `SETUP_REPO_RAW`, so the installer and the updater patch the same way.
+     If that file can't be fetched, the fix is skipped and the run warns.
+   - the WHEP follow-up location matches stream paths with slashes.
 
-| | Legacy | `raven` (fresh install from GitHub) |
-|---|---|---|
-| Set up by | the original single-user install | [c4raven-server-setup](https://github.com/C4-Raven/c4raven-server-setup)'s `install.sh` or online `.deb` |
-| Owner | your login user | the `raven` system user |
-| Backend | `~/src/c4raven-server`, venv `~/.opentakserver_venv` | `/opt/raven/c4raven-server` (Poetry venv in `.venv`) |
-| Data | `~/ots` | `/opt/raven/data` |
-| UI served from | `/var/www/html/opentakserver` | `/var/www/html/raven` |
-| Services | `opentakserver`, `eud_handler`, `eud_handler_ssl`, `cot_parser` | `raven`, `eud_handler`, `eud_handler_ssl`, `cot_parser`, `mediamtx` (+ `federation-hub` if running) |
+   Each changed file is copied to `/etc/nginx/raven-backups/<time>/` first.
+   Then `nginx -t` runs: if it passes nginx is reloaded, and if it fails
+   every file is restored.
+7. **Restart and check**: restarts the services, waits for
+   `/api/health`, reports any unit that isn't active, the database revision
+   and a summary of what changed.
 
-Legacy is used when `~/.opentakserver_venv` exists, otherwise `raven`
-when `/opt/raven/c4raven-server` is a git checkout. On the `raven` layout
-every git, Poetry and yarn step runs as the `raven` user (via `sudo -u
-raven`), so file ownership stays the way `install.sh` left it. A server
-installed from the **offline** `.deb` has no source checkout to pull; the
-script refuses it and points you at a newer offline bundle instead.
+Every network step (git, poetry/pip, yarn, curl, apt/dnf) is retried up to
+5 times with growing pauses (5s, 10s, 20s, 40s; `RETRY_ATTEMPTS` changes the
+count), and a failure says what was and wasn't changed. Two runs can't
+overlap (a lock file).
 
-Database migrations run themselves, the same way they always have — the
-app runs them on startup, no separate step needed.
+It works on every install type and picks the right one by itself:
+
+| | Legacy | `raven` (install.sh / online `.deb` / `.rpm`) | Offline `.deb` / `.rpm` |
+|---|---|---|---|
+| Owner | your login user | the `raven` system user | the `raven` system user |
+| Backend | `~/src/c4raven-server`, venv `~/.opentakserver_venv` | `/opt/raven/c4raven-server` (Poetry venv in `.venv`) | `/opt/raven/venv` (no source checkout) |
+| Data | `~/ots` | `/opt/raven/data` | `/opt/raven/data` |
+| UI served from | `/var/www/html/opentakserver` | `/var/www/html/raven` | `/var/www/html/raven` |
+| Services | `opentakserver`, `eud_handler`, `eud_handler_ssl`, `cot_parser` | `raven`, `eud_handler`, `eud_handler_ssl`, `cot_parser`, `mediamtx` (+ `federation-hub` if running) | same as `raven` |
+
+Detection order: legacy when `~/.opentakserver_venv` exists, then `raven`
+when `/opt/raven/c4raven-server` is a git checkout, then offline when
+`/opt/raven/venv` is a symlink. On the `raven` layout every git, Poetry,
+yarn and flask step runs as the `raven` user, so file ownership stays the
+way the installer left it. A packaged install that sits on a detached
+commit is moved onto `main` when that loses nothing.
+**Offline installs** get only the config.yml and nginx fixes, because
+their code is upgraded by installing a newer offline bundle.
+
+On the `raven` layout, if the install never finished (no `raven.service`,
+no secrets file, or no PostgreSQL database in `config.yml`), `update.sh`
+runs `finish-install.sh` first and then carries on with the update.
+
+### Behaviour change in 2.3.0
+
+The connection device profile (`/Marti/api/device/profile/connection`,
+`/api/connection`) now requires a verified client certificate or Basic
+credentials (`RAVEN_CONNECTION_PROFILE_REQUIRE_AUTH: true`). If you have
+devices that fetch it over plain HTTP without credentials (plain TCP
+streaming connections), add `RAVEN_CONNECTION_PROFILE_REQUIRE_AUTH: false` to
+`config.yml` and restart. The updater does not write this setting for you.
 
 ## What this never does
 
 - Never drops, recreates, or truncates the database. The only database
-  changes come from the app's own Alembic migrations, which are
-  additive by convention.
-- Never deletes anything in your data directory — `config.yml`,
-  certificates, uploaded data packages, `icons.sqlite`, and your
-  MediaMTX config are all left alone. Never touches `logs/`.
-- Never merges or rebases over local, uncommitted work in either source
-  checkout. If either has commits or changes that aren't on its
-  `origin/main`, the script stops and tells you rather than trying to
-  reconcile them for you.
-
-Everything that could go wrong is backed up first, before any change is
-made.
+  changes come from the app's own Alembic migrations.
+- Never deletes anything in your data directory. Never touches `logs/`
+  apart from making the log files readable by the service user.
+- Never edits `config.yml` (finish-install.sh only fills in a missing
+  database URI) and never replaces an nginx site file wholesale. It only makes
+  the targeted in-place fixes listed above.
+- Never merges or rebases over local work in either source checkout. If
+  either has commits or changes that aren't on `origin/main`, it stops and
+  says so.
 
 ## Usage
 
@@ -73,19 +122,30 @@ cd c4raven-updater
 ./update.sh
 ```
 
-Run it as your own sudo-capable user (not root, not `raven`). It needs
-`sudo` to restart the services (and, on the `raven` layout, to act as
-the `raven` user), plus network access to GitHub and your npm registry.
+Run it as your own sudo-capable user (not `raven`), or as root, e.g. inside
+a container. It needs network access to GitHub and the npm/PyPI registries.
+
+### Docker
+
+Both scripts work in a container whose PID 1 is systemd, such as
+c4raven-server-setup's `tests/images` Dockerfiles run with `--privileged
+--cgroupns=host --tmpfs /run --tmpfs /run/lock -v
+/sys/fs/cgroup:/sys/fs/cgroup:rw`. In a container **without** systemd as
+PID 1 (a plain `docker run`), they say so and keep going: every step that
+doesn't need a service manager still runs (pull, dependencies, UI,
+migrations, config, nginx files), service restarts are skipped, and the
+summary lists what you have to restart yourself. `finish-install.sh` can't
+start services there, so it only gets as far as the configuration.
+`RAVEN_NO_SYSTEMD=1` forces this mode.
 
 ### Configuration
 
-If your paths differ from the defaults, override with environment
-variables. Where a default differs by layout it's shown as
-legacy / `raven`:
+Override with environment variables. Where a default differs by layout it's
+shown as legacy / `raven`:
 
 | Variable          | Default                        | What it is                                       |
 |-------------------|---------------------------------|---------------------------------------------------|
-| `LAYOUT`          | `auto`                          | `legacy` or `raven` to skip detection              |
+| `LAYOUT`          | `auto`                          | `legacy`, `raven` or `offline` to skip detection  |
 | `RAVEN_HOME`      | `/opt/raven`                    | Root of the `raven` layout                         |
 | `RAVEN_USER`      | `raven`                         | Account that owns the `raven` layout               |
 | `RAVEN_VENV`      | `~/.opentakserver_venv` / `/opt/raven/c4raven-server/.venv` | Python virtualenv the backend runs from |
@@ -94,13 +154,16 @@ legacy / `raven`:
 | `SERVER_SRC_DIR`  | `~/src/c4raven-server` / `/opt/raven/c4raven-server` | Backend source checkout |
 | `UI_SRC_DIR`      | `~/src/c4raven-ui` / `/opt/raven/c4raven-ui` | Where the frontend source is cloned/built |
 | `UI_DEPLOY_DIR`   | `/var/www/html/opentakserver` / `/var/www/html/raven` | Where the built frontend is served from |
+| `SERVER_BRANCH`, `UI_BRANCH` | `main`               | Branch to fast-forward to                          |
 | `BACKUP_ROOT`     | `~/backups`                     | Where timestamped backups are written              |
-| `SERVER_REPO`     | `https://github.com/C4-Raven/c4raven-server.git` | Cloned only if `SERVER_SRC_DIR` doesn't exist yet |
-| `UI_REPO`         | `https://github.com/C4-Raven/c4raven-ui.git` | Cloned only if `UI_SRC_DIR` doesn't exist yet |
-| `HEALTH_URL`      | `https://127.0.0.1/api/health` / `http://127.0.0.1:8081/api/health` | Polled after the restart until it returns 200 |
-| `HEALTH_TRIES`    | `30`                             | Health checks, 2 seconds apart                     |
-| `SKIP_UI`         | `0`                              | Set to `1` to update the backend only              |
-| `SKIP_BACKEND`    | `0`                              | Set to `1` to update the frontend only             |
+| `SERVER_REPO`, `UI_REPO` | the C4-Raven GitHub repos | Cloned only if the checkout doesn't exist yet      |
+| `HEALTH_URL`      | `https://127.0.0.1/api/health` / `http://127.0.0.1:8081/api/health` | Polled after the restart |
+| `HEALTH_TRIES`    | `60`                            | Health checks, 2 seconds apart                     |
+| `RETRY_ATTEMPTS`  | `5`                             | Tries for each network operation                   |
+| `SKIP_UI` / `SKIP_BACKEND` / `SKIP_NGINX` | `0`     | `1` leaves that part alone                         |
+| `FORCE_UI_BUILD`  | `0`                             | `1` rebuilds the UI even if its commit is deployed |
+| `SKIP_DB_BACKUP`  | `0`                             | `1` migrates without a `pg_dump` (only if you have your own backup) |
+| `SETUP_REPO_RAW`  | c4raven-server-setup `master` on GitHub | Where the X-Ssl-Cert patcher and (for finish-install.sh) the templates come from; `file:///path` for a local checkout |
 
 Example:
 
@@ -110,50 +173,101 @@ RAVEN_DATA_DIR=/opt/ots ./update.sh
 
 ## Finishing a half-done install
 
-If `./update.sh` reports `Unit raven.service not found`, the server's
-`install.sh` stopped partway (it exits at the first failed command) and
-the backend was never set up to run, so nobody can log in.
-`./finish-install.sh` redoes everything after the UI build (RabbitMQ with
-its plugins enabled first, the secrets file, the raven / eud_handler /
-cot_parser units), starts the services, waits for the backend and tests
-an `administrator` login. Each step prints the real error if it fails. It
-leaves the database contents, `config.yml`, certificates and nginx alone.
+`install.sh` stops at the first command that fails. Everything after that
+point is left undone, typically leaving `Unit raven.service not found` and
+a web UI nobody can log in to. `./finish-install.sh` (for the `raven`
+layout) checks each piece in install order and repairs only what is
+missing or broken:
+
+| Piece | What it checks / does when missing |
+|---|---|
+| packages | stops and tells you to re-run `install.sh` if PostgreSQL, nginx, RabbitMQ, git... aren't installed |
+| backend | clones `c4raven-server`, installs Poetry, runs `poetry install` |
+| `config.yml` | `flask raven generate-config` (an existing one is never regenerated) |
+| PostgreSQL | starts it; creates the `raven` role and database and grants; points `config.yml` at it; if the role exists with a different password, resets the role to the password in `config.yml` |
+| schema | `flask db upgrade` to head, verified |
+| CA | `flask raven create-ca` / `issue-server-certificate` if the files are missing |
+| MediaMTX | binary, `mediamtx.yml`, the webhook token, `mediamtx.service` |
+| nginx | the `stream {}` block, `proxy_params`, the `raven_http` / `raven_https` / `raven_certificate_enrollment` sites and the `rabbitmq` / `mediamtx` streams (from c4raven-server-setup's templates), enabling them, the hardening fixes above, `nginx -t` |
+| web UI | builds and deploys it when `index.html` is missing (`REBUILD_UI=1` forces it) |
+| RabbitMQ | plugins enabled first, then `rabbitmq.conf`; restarted only if that changed or it's down |
+| secrets file | `/opt/raven/.raven-secrets.env`, kept in step with `config.yml`'s database URI |
+| services | writes `raven` / `eud_handler` / `eud_handler_ssl` / `cot_parser` units that don't exist anywhere (packaged units are left alone), enables them and starts whatever isn't running |
+| admin | runs `seed_admin.py` (it only touches a brand-new database) and tests an `administrator` login |
+
+It never drops the database, never regenerates an existing CA or
+`config.yml`, and never replaces an existing nginx site. Templates come
+from `SETUP_REPO_RAW` (default: c4raven-server-setup's `master` on GitHub;
+`file:///path/to/c4raven-server-setup` uses a local checkout).
 
 ## Login problems
 
 `./diagnose-login.sh` (on the `raven` layout) checks why the web UI won't
-log in, without changing anything: service states, code versions, the
-login-related settings (no secrets), every account's active / site-access
-/ forced-password-change / two-factor flags, a scripted browser-style
-login both straight to the backend and through nginx, the nginx sites and
-certificates, and recent errors. It tests `administrator` / `password` by
-default; use `LOGIN_USER=... LOGIN_PASS=... ./diagnose-login.sh` for
+log in, without changing anything: service states, code versions, whether
+the database schema is at head, the login-related settings (no secrets),
+every account's active / site-access / forced-password-change / two-factor
+flags, a scripted browser-style login both straight to the backend and
+through nginx, the nginx sites (including whether they clear `X-Ssl-Cert`)
+and certificates, and recent errors. It tests `administrator` / `password`
+by default; use `LOGIN_USER=... LOGIN_PASS=... ./diagnose-login.sh` for
 another account.
 
 ## Rolling back
 
-Every run writes a timestamped backup directory before touching
-anything, printed at the end of the run (also under `~/backups/update-*`).
-Inside it:
+Every `update.sh` run writes a backup directory before changing anything.
+Its path is printed at the end (`~/backups/update-<time>/`), and only you
+can read it, because it holds `config.yml` and the CA's private keys:
 
-- `server-commit.txt` — the backend git commit that was checked out
-  before the update. Legacy: `git -C ~/src/c4raven-server checkout $(cat server-commit.txt)`
-  then re-run `pip install -e ~/src/c4raven-server` in the venv. `raven`
-  layout: `sudo -u raven -H bash -lc "cd /opt/raven/c4raven-server && git checkout $(cat server-commit.txt) && poetry install"`
-- `database.sql.gz` — a full `pg_dump`, restore with
-  `gunzip -c database.sql.gz | psql <connection-string>`
-- `raven-data.tar.gz` — your data directory (minus logs), restore by
-  extracting it back over your data dir (with `sudo` on the `raven`
-  layout, then `sudo chown -R raven:raven /opt/raven/data`)
-- `ui/` — the previously-deployed frontend, restore with
-  `rsync -a --delete ui/ <UI served from>/`
+| File | What it is |
+|---|---|
+| `server-commit.txt`, `ui-commit.txt` | the commits that were checked out before |
+| `db-revision.txt` | the database's Alembic revision before |
+| `database.sql.gz` | a full `pg_dump` |
+| `raven-data.tar.gz` | the data directory, minus `logs/` |
+| `nginx.tar.gz` | `/etc/nginx` |
+| `ui/` | the previously deployed frontend |
 
-The backup directory is readable by you only: it holds `config.yml` and
-the certificate authority's private keys.
+To roll back completely (`raven` layout, run from inside the backup
+directory):
 
-After restoring whichever pieces you need, restart the services listed
-in the table above, e.g. on the `raven` layout:
-`sudo systemctl restart raven eud_handler eud_handler_ssl cot_parser mediamtx`.
+```
+sudo systemctl stop raven eud_handler eud_handler_ssl cot_parser
+# code
+sudo -u raven -H bash -lc "cd /opt/raven/c4raven-server && git checkout $(cat server-commit.txt) && poetry install"
+# database: recreate it empty, then load the dump
+sudo -u postgres psql -c 'DROP DATABASE raven' -c 'CREATE DATABASE raven OWNER raven'
+gunzip -c database.sql.gz | sudo -u postgres psql -d raven
+# UI
+sudo rsync -a --delete ui/ /var/www/html/raven/
+# config / certificates, only if you need them back
+sudo tar -xzf raven-data.tar.gz -C /opt/raven && sudo chown -R raven:raven /opt/raven/data
+# nginx, only if you need it back
+sudo tar -xzf nginx.tar.gz -C /etc && sudo nginx -t && sudo systemctl reload nginx
+sudo systemctl start raven eud_handler eud_handler_ssl cot_parser
+```
+
+Restore the database **and** the code together. The old code can't run
+against the migrated schema, and the new code migrates an old database
+forward again as soon as it starts. Legacy layout: use
+`git -C ~/src/c4raven-server checkout <commit>` with
+`~/.opentakserver_venv/bin/pip install -e ~/src/c4raven-server`, the `ots`
+database, `~/ots`, `/var/www/html/opentakserver` and `opentakserver` in
+place of `raven`. The nginx fixes have their own per-file copies in
+`/etc/nginx/raven-backups/<time>/`.
+
+## Testing
+
+`tests/docker-scenarios.sh /path/to/c4raven-server-setup [ubuntu-24.04|rocky-9]`
+makes a real `install.sh` install in a systemd container (using the setup
+repo's harness), then runs four scenarios:
+
+- an upgrade from an older-looking install, plus a second no-op run
+- repairing a half-finished install, plus a second no-op run
+- an install that died before the database step
+- running without systemd
+
+CI (`.github/workflows/test.yml`) runs shellcheck on every push and runs
+the scenarios on both distros for `master`.
 
 ## Pulling in upstream changes
 
