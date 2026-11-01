@@ -1,50 +1,41 @@
 #!/usr/bin/env bash
-# C4 Raven updater -- deploys the latest c4raven-server (backend) and
-# c4raven-ui (frontend) in place, without touching the database contents,
-# uploaded files, certificates, or config.yml.
+# C4 Raven updater -- brings an existing install fully up to date, in place:
 #
-# Both are our own git forks now (not a pip package + patch file), so
-# "update" means: pull our fork's latest commits and redeploy. It does
-# NOT pull in new upstream OpenTAKServer changes -- that's a separate,
-# deliberate maintenance step (see "Pulling in upstream changes" in
-# README.md) done by a maintainer in a dev checkout, tested, and pushed
-# to our fork first. This script only ever fast-forwards to what's
-# already on our own origin/main.
+#   1. backs up the database (pg_dump), the data directory (config.yml,
+#      certificates, uploads), the deployed UI and /etc/nginx
+#   2. fast-forwards c4raven-server to origin/main, installs its Python
+#      dependencies into the venv
+#   3. fast-forwards c4raven-ui to origin/main, rebuilds and redeploys it
+#   4. stops the Raven services, runs the database migrations to head and
+#      checks the database really is at head
+#   5. leaves config.yml alone (new settings use the code's defaults; see
+#      NEW_CONFIG_KEYS in lib/common.sh), fills in MediaMTX's token if missing,
+#      makes the log files belong to the service user
+#   6. applies the current nginx template fixes to the existing site files
+#      (backup, nginx -t, roll back on failure)
+#   7. starts everything again, health-checks it and prints a summary
 #
-# It updates either server layout (detected automatically, see below):
-# the legacy single-user one, and the `raven`-user one that
-# c4raven-server-setup's install.sh creates.
-#
-# What this does NOT do, ever:
-#   - drop, recreate, or truncate the database (only additive Alembic
-#     migrations run, via the app's own normal startup path)
-#   - delete anything under $RAVEN_DATA_DIR (certs, config.yml, uploads,
-#     icons.sqlite, mediamtx config)
-#   - touch $RAVEN_DATA_DIR/logs
-#   - merge or rebase over local changes in either source checkout
-#
-# It DOES back up the database and $RAVEN_DATA_DIR before making any
-# change, so a bad update can be rolled back. See README.md for rollback
-# steps.
-
+# Safe to re-run: every step checks first and skips what is already current.
+# It never drops or truncates the database, never deletes anything in the
+# data directory, and never merges or rebases over local changes. A server
+# whose first install stopped partway is completed with finish-install.sh
+# first (automatically). See README.md for the layouts and for rollback.
 set -euo pipefail
 
-log() { printf '\n\033[1;34m==>\033[0m %s\n' "$1"; }
-warn() { printf '\033[1;33m! %s\033[0m\n' "$1"; }
-die() { printf '\033[1;31mERROR: %s\033[0m\n' "$1" >&2; exit 1; }
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+. "$HERE/lib/common.sh"
 
-# ---- layout ---------------------------------------------------------------------
-#   legacy  one login user owns everything: backend venv ~/.opentakserver_venv,
-#           data ~/ots, source in ~/src, UI in /var/www/html/opentakserver,
+# ---- layout -----------------------------------------------------------------
+#   legacy  one login user owns everything: venv ~/.opentakserver_venv, data
+#           ~/ots, source in ~/src, UI in /var/www/html/opentakserver,
 #           opentakserver.service
-#   raven   c4raven-server-setup's install.sh (or its online .deb): a `raven`
-#           system user owns /opt/raven/{c4raven-server,c4raven-ui,data}
-#           (mode 750), UI in /var/www/html/raven, raven.service
-#
-# LAYOUT=auto picks legacy when ~/.opentakserver_venv exists, otherwise raven
-# when /opt/raven/c4raven-server is a git checkout. An install from the
-# OFFLINE .deb has no source checkout to pull (just /opt/raven/venv); it is
-# updated by running install.sh from a newer offline bundle, so it's refused.
+#   raven   c4raven-server-setup's install.sh, online .deb or .rpm: a `raven`
+#           system user owns /opt/raven/{c4raven-server,c4raven-ui,data},
+#           UI in /var/www/html/raven, raven.service
+#   offline the offline .deb/.rpm: /opt/raven/venv, no source checkout. Its
+#           code is upgraded by installing a newer offline bundle; this
+#           script only applies the config and nginx fixes there.
 LAYOUT="${LAYOUT:-auto}"
 RAVEN_HOME="${RAVEN_HOME:-/opt/raven}"
 RAVEN_USER="${RAVEN_USER:-raven}"
@@ -52,16 +43,15 @@ RAVEN_USER="${RAVEN_USER:-raven}"
 if [[ "$LAYOUT" == auto ]]; then
     if [[ -d "$HOME/.opentakserver_venv" ]]; then
         LAYOUT=legacy
-    elif sudo test -d "$RAVEN_HOME/c4raven-server/.git"; then
+    elif as_root test -d "$RAVEN_HOME/c4raven-server/.git"; then
         LAYOUT=raven
-    elif sudo test -L "$RAVEN_HOME/venv"; then
-        die "This server was installed from the offline package ($RAVEN_HOME/venv, no source checkout). Update it by running install.sh from a newer c4raven-server-offline bundle."
+    elif as_root test -L "$RAVEN_HOME/venv"; then
+        LAYOUT=offline
     else
-        die "No C4 Raven install found (looked for ~/.opentakserver_venv and $RAVEN_HOME/c4raven-server). If yours lives elsewhere, set LAYOUT=legacy or LAYOUT=raven plus the paths in README.md."
+        die "No C4 Raven install found (looked for ~/.opentakserver_venv, $RAVEN_HOME/c4raven-server and $RAVEN_HOME/venv). If yours lives elsewhere, set LAYOUT=legacy or LAYOUT=raven plus the paths in README.md."
     fi
 fi
 
-# ---- configuration (override via environment) ------------------------------
 case "$LAYOUT" in
     legacy)
         RAVEN_VENV="${RAVEN_VENV:-$HOME/.opentakserver_venv}"
@@ -72,241 +62,374 @@ case "$LAYOUT" in
         UI_DEPLOY_DIR="${UI_DEPLOY_DIR:-/var/www/html/opentakserver}"
         HEALTH_URL="${HEALTH_URL:-https://127.0.0.1/api/health}"
         ;;
-    raven)
-        RAVEN_VENV="${RAVEN_VENV:-$RAVEN_HOME/c4raven-server/.venv}"
+    raven|offline)
+        if [[ "$LAYOUT" == raven ]]; then
+            RAVEN_VENV="${RAVEN_VENV:-$RAVEN_HOME/c4raven-server/.venv}"
+        else
+            RAVEN_VENV="${RAVEN_VENV:-$RAVEN_HOME/venv}"
+        fi
         RAVEN_DATA_DIR="${RAVEN_DATA_DIR:-$RAVEN_HOME/data}"
         RAVEN_SERVICES="${RAVEN_SERVICES:-raven.service eud_handler.service eud_handler_ssl.service cot_parser.service mediamtx.service}"
         SERVER_SRC_DIR="${SERVER_SRC_DIR:-$RAVEN_HOME/c4raven-server}"
         UI_SRC_DIR="${UI_SRC_DIR:-$RAVEN_HOME/c4raven-ui}"
         UI_DEPLOY_DIR="${UI_DEPLOY_DIR:-/var/www/html/raven}"
-        # Straight to the backend: nginx on 443 may be serving a certificate
-        # for the domain only, and 127.0.0.1:8081 is what install.sh polls.
+        # Straight to the backend: nginx on 443 may only have a certificate
+        # for the domain, and 127.0.0.1:8081 is what install.sh polls.
         HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8081/api/health}"
         ;;
     *)
-        die "LAYOUT must be auto, legacy or raven (got '$LAYOUT')"
+        die "LAYOUT must be auto, legacy, raven or offline (got '$LAYOUT')"
         ;;
 esac
 
 SERVER_REPO="${SERVER_REPO:-https://github.com/C4-Raven/c4raven-server.git}"
 UI_REPO="${UI_REPO:-https://github.com/C4-Raven/c4raven-ui.git}"
-
-SKIP_UI="${SKIP_UI:-0}"                       # set to 1 to update backend only
-SKIP_BACKEND="${SKIP_BACKEND:-0}"             # set to 1 to update UI only
-
+SERVER_BRANCH="${SERVER_BRANCH:-main}"
+UI_BRANCH="${UI_BRANCH:-main}"
+SKIP_UI="${SKIP_UI:-0}"                 # 1 = backend only
+SKIP_BACKEND="${SKIP_BACKEND:-0}"       # 1 = UI only
+SKIP_NGINX="${SKIP_NGINX:-0}"           # 1 = leave nginx alone
+SKIP_DB_BACKUP="${SKIP_DB_BACKUP:-0}"   # 1 = migrate without a pg_dump first (not recommended)
+FORCE_UI_BUILD="${FORCE_UI_BUILD:-0}"   # 1 = rebuild the UI even if its commit hasn't changed
 BACKUP_ROOT="${BACKUP_ROOT:-$HOME/backups}"
-HEALTH_TRIES="${HEALTH_TRIES:-30}"            # 2s apart
+HEALTH_TRIES="${HEALTH_TRIES:-60}"      # 2s apart
 
-# Run a command as whoever owns the install: you (legacy), or the raven
-# system user (raven layout -- its directories aren't readable by anyone
-# else). A login shell, so the raven user's ~/.local/bin (poetry) is on PATH.
-as_app() {
-    if [[ "$LAYOUT" == raven ]]; then
-        # cd /: the raven user can't read the directory you launched from.
-        sudo -u "$RAVEN_USER" -H bash -lc "cd / && $(printf '%q ' "$@")"
-    else
-        "$@"
-    fi
-}
+# The account that owns the install (and runs every git/pip/yarn/flask step,
+# so ownership stays as the installer left it).
+if [[ "$LAYOUT" == legacy ]]; then
+    APP_OWNER="${APP_OWNER:-$(stat -c %U "$RAVEN_DATA_DIR" 2>/dev/null || id -un)}"
+else
+    APP_OWNER="$RAVEN_USER"
+fi
+as_app() { as_user "$APP_OWNER" "$@"; }
+as_app_sh() { as_user_sh "$APP_OWNER" "$1"; }
+WORKDIR="$SERVER_SRC_DIR"
+[[ "$LAYOUT" == raven ]] || WORKDIR="$RAVEN_DATA_DIR"
 
-# Root for the raven layout (files there belong to another user), plain
-# otherwise.
-as_owner_root() {
-    if [[ "$LAYOUT" == raven ]]; then
-        sudo "$@"
-    else
-        "$@"
-    fi
-}
+# One run at a time (finish-install.sh, when called from here, shares it).
+if [[ -z "${RAVEN_UPDATER_LOCKED:-}" ]] && command -v flock >/dev/null 2>&1; then
+    exec 9>"${TMPDIR:-/tmp}/c4raven-updater.lock"
+    flock -n 9 || die "Another update.sh / finish-install.sh is already running."
+    export RAVEN_UPDATER_LOCKED=1
+fi
 
-log "Updating the $LAYOUT layout (data: $RAVEN_DATA_DIR)"
+log "Updating the $LAYOUT layout (data: $RAVEN_DATA_DIR, owner: $APP_OWNER)"
+systemd_notice
 
 as_app test -d "$RAVEN_VENV" || die "RAVEN_VENV not found: $RAVEN_VENV"
-as_app test -d "$RAVEN_DATA_DIR" || die "RAVEN_DATA_DIR not found: $RAVEN_DATA_DIR"
-as_app test -f "$RAVEN_DATA_DIR/config.yml" || die "$RAVEN_DATA_DIR/config.yml not found -- wrong RAVEN_DATA_DIR?"
-
+as_app test -f "$RAVEN_DATA_DIR/config.yml" || {
+    [[ "$LAYOUT" == raven ]] && die "$RAVEN_DATA_DIR/config.yml not found: this install stopped very early. Run ./finish-install.sh."
+    die "$RAVEN_DATA_DIR/config.yml not found -- wrong RAVEN_DATA_DIR?"
+}
 PYTHON="$RAVEN_VENV/bin/python"
-PIP="$RAVEN_VENV/bin/pip"
 as_app test -x "$PYTHON" || die "$PYTHON not found -- wrong RAVEN_VENV?"
 
-PREV_COMMIT="$(as_app git -C "$SERVER_SRC_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+# The app's own CLI (flask db ..., used below) writes to logs/raven.log too,
+# and dies on a log file systemd created as root -- fix that before anything
+# runs it.
+MAIN_LOG=raven.log
+[[ "$LAYOUT" == legacy ]] && MAIN_LOG=opentakserver.log
+fix_log_ownership "$APP_OWNER" "$RAVEN_DATA_DIR/logs" "$MAIN_LOG" || true
 
+# ---- an install that never finished: complete it first ----------------------
+# install.sh writes the services near its very end, so a run that died
+# earlier leaves no raven.service, no secrets file, maybe no database.
+if [[ "$LAYOUT" == raven ]]; then
+    incomplete=""
+    unit_exists raven.service || incomplete="raven.service is missing"
+    as_root test -f "$RAVEN_HOME/.raven-secrets.env" || incomplete="${incomplete:+$incomplete, }the secrets file is missing"
+    case "$(config_get "$PYTHON" "$RAVEN_DATA_DIR/config.yml" "$APP_OWNER" SQLALCHEMY_DATABASE_URI 2>/dev/null)" in
+        postgresql*) ;;
+        *) incomplete="${incomplete:+$incomplete, }config.yml has no PostgreSQL database" ;;
+    esac
+    if [[ -n "$incomplete" ]]; then
+        warn "This server's install never finished ($incomplete). Running finish-install.sh first."
+        "$HERE/finish-install.sh" || die "finish-install.sh could not complete the install (see above); fix that and re-run."
+    fi
+fi
+
+# ---- offline package: config + nginx only ------------------------------------
+if [[ "$LAYOUT" == offline ]]; then
+    log "Offline package install: the code is updated by a newer offline bundle, not from GitHub"
+    out=$(config_add_keys "$PYTHON" "$RAVEN_DATA_DIR/config.yml" "$APP_OWNER" "$RAVEN_HOME/.raven-secrets.env") || warn "could not add new settings to config.yml"
+    [[ -n "${out:-}" ]] && fixed "config.yml: added $(echo "$out" | tr '\n' ' ')"
+    [[ "$SKIP_NGINX" == 1 ]] || nginx_harden || true
+    echo
+    print_summary
+    cat <<EOF
+
+To update the code itself, run install.sh from a newer
+c4raven-server-offline bundle (or: sudo apt install ./c4raven-server_<version>_<arch>.deb).
+EOF
+    exit 0
+fi
+
+# ---- network preflight -------------------------------------------------------
+if [[ "$SKIP_BACKEND" != 1 ]]; then
+    log "Checking that GitHub is reachable"
+    retry as_app git ls-remote --exit-code "$SERVER_REPO" "refs/heads/$SERVER_BRANCH" >/dev/null \
+        || die "Can't reach $SERVER_REPO (after retries). Check this server's internet access / DNS / proxy and re-run; nothing has been changed."
+fi
+
+# ---- backups -----------------------------------------------------------------
+PREV_COMMIT="$(as_app git -C "$SERVER_SRC_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+PREV_UI_COMMIT="$(as_app git -C "$UI_SRC_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="$BACKUP_ROOT/update-$TS"
-# The backup holds config.yml (database password, secret keys) and the CA's
-# private keys: keep it readable by you only.
+# Holds config.yml (DB password, secret keys) and the CA's private keys.
 mkdir -p "$BACKUP_ROOT"
 mkdir -m 700 "$BACKUP_DIR"
-
-log "Backing up to $BACKUP_DIR (backend currently at commit ${PREV_COMMIT})"
+log "Backing up to $BACKUP_DIR"
 echo "$PREV_COMMIT" > "$BACKUP_DIR/server-commit.txt"
+echo "$PREV_UI_COMMIT" > "$BACKUP_DIR/ui-commit.txt"
 
-# ---- back up the database ---------------------------------------------------
-log "Dumping database"
-DB_URI="$(as_app "$PYTHON" -c '
-import sys, yaml
-with open(sys.argv[1]) as f:
-    print(yaml.safe_load(f)["SQLALCHEMY_DATABASE_URI"])
-' "$RAVEN_DATA_DIR/config.yml")"
-# pg_dump doesn't understand the SQLAlchemy "+psycopg" driver suffix.
-PG_URI="$(python3 -c "import sys; print(sys.argv[1].replace('postgresql+psycopg://', 'postgresql://'))" "$DB_URI")"
-if command -v pg_dump >/dev/null 2>&1; then
-    pg_dump "$PG_URI" | gzip > "$BACKUP_DIR/database.sql.gz"
-    log "Database backed up to $BACKUP_DIR/database.sql.gz"
+DB_URI="$(config_get "$PYTHON" "$RAVEN_DATA_DIR/config.yml" "$APP_OWNER" SQLALCHEMY_DATABASE_URI)"
+DB_REV_BEFORE="$(db_revisions "$APP_OWNER" "$RAVEN_VENV" "$RAVEN_DATA_DIR" "$WORKDIR" current || true)"
+echo "${DB_REV_BEFORE:-unknown}" > "$BACKUP_DIR/db-revision.txt"
+
+if [[ "$SKIP_DB_BACKUP" == 1 ]]; then
+    warn "SKIP_DB_BACKUP=1 -- no database backup taken"
+elif [[ "$DB_URI" == postgresql* ]]; then
+    if ! command -v pg_dump >/dev/null 2>&1; then
+        warn "pg_dump not on PATH; installing the PostgreSQL client"
+        if [[ "$PKG_MGR" == apt ]]; then pkg_install postgresql-client || true; else pkg_install postgresql || true; fi
+    fi
+    command -v pg_dump >/dev/null 2>&1 || die "pg_dump is not available, so the database can't be backed up before migrating. Install postgresql-client (Rocky: postgresql), or re-run with SKIP_DB_BACKUP=1 if you have your own backup."
+    if pg_dump "$(pg_uri "$DB_URI")" > "$BACKUP_DIR/database.sql" 2> "$BACKUP_DIR/pg_dump.err"; then
+        gzip "$BACKUP_DIR/database.sql"
+        rm -f "$BACKUP_DIR/pg_dump.err"
+        ok "database dumped to $BACKUP_DIR/database.sql.gz ($(du -h "$BACKUP_DIR/database.sql.gz" | cut -f1))"
+    else
+        cat "$BACKUP_DIR/pg_dump.err" >&2
+        die "pg_dump failed (above), so nothing was changed. A server/client version mismatch is the usual cause: install the matching postgresql-client, or re-run with SKIP_DB_BACKUP=1 if you have your own backup."
+    fi
 else
-    warn "pg_dump not found on PATH -- skipping database backup. Install it (Debian/Ubuntu: postgresql-client, Rocky/RHEL: postgresql) or back up manually before proceeding."
+    warn "config.yml's database is not PostgreSQL (${DB_URI%%:*}); copy it yourself if it lives outside the data directory"
 fi
 
-# ---- back up the data directory (config, certs, uploads, icons) ------------
-log "Backing up $RAVEN_DATA_DIR (excluding logs/)"
-# The data dir is live (icons.sqlite, uploads); tar exits 1 for "file changed
-# as we read it", which is a warning here, not a failed backup. Anything
-# else (exit 2) is a real error and still aborts.
-as_owner_root tar --warning=no-file-changed --exclude='logs' -czf "$BACKUP_DIR/raven-data.tar.gz" \
+as_root tar --warning=no-file-changed --exclude='logs' -czf "$BACKUP_DIR/raven-data.tar.gz" \
     -C "$(dirname "$RAVEN_DATA_DIR")" "$(basename "$RAVEN_DATA_DIR")" || [[ $? -eq 1 ]]
-as_owner_root chown "$(id -u):$(id -g)" "$BACKUP_DIR/raven-data.tar.gz"
+as_root chown "$(id -u):$(id -g)" "$BACKUP_DIR/raven-data.tar.gz"
 chmod 600 "$BACKUP_DIR/raven-data.tar.gz"
-
-# ---- back up the currently-deployed UI --------------------------------------
-if [[ -d "$UI_DEPLOY_DIR" ]]; then
-    log "Backing up currently deployed UI"
-    mkdir -p "$BACKUP_DIR/ui"
-    cp -a "$UI_DEPLOY_DIR/." "$BACKUP_DIR/ui/" 2>/dev/null || true
+ok "data directory archived (excluding logs/)"
+if as_root test -d /etc/nginx; then
+    as_root tar -czf "$BACKUP_DIR/nginx.tar.gz" -C /etc nginx 2>/dev/null || true
+    as_root chown "$(id -u):$(id -g)" "$BACKUP_DIR/nginx.tar.gz" 2>/dev/null || true
 fi
+if [[ -d "$UI_DEPLOY_DIR" ]]; then
+    mkdir -p "$BACKUP_DIR/ui"
+    as_root cp -a "$UI_DEPLOY_DIR/." "$BACKUP_DIR/ui/" 2>/dev/null || true
+fi
+ok "backup complete -- nothing has been changed yet"
 
-log "Backup complete. Nothing destructive has happened yet."
-
-# ---- update the backend -----------------------------------------------------
-if [[ "$SKIP_BACKEND" != "1" ]]; then
-    if as_app test -d "$SERVER_SRC_DIR/.git"; then
-        log "Fetching c4raven-server"
-        # raven/__init__.py is a version stamp that poetry-dynamic-versioning
-        # rewrites on every install; discard that drift so it can't block
-        # the fast-forward (git refuses to overwrite a modified file).
-        as_app git -C "$SERVER_SRC_DIR" checkout -- raven/__init__.py 2>/dev/null || true
-        as_app git -C "$SERVER_SRC_DIR" fetch origin
-        if ! as_app git -C "$SERVER_SRC_DIR" merge --ff-only origin/main; then
-            as_app git -C "$SERVER_SRC_DIR" status --short
-            die "c4raven-server has local commits or modified files (listed above) that block a fast-forward to origin/main. Resolve them in $SERVER_SRC_DIR (commit/stash/push as appropriate), then re-run."
+# ---- git helper ----------------------------------------------------------------
+# git_update DIR REPO BRANCH STAMP_FILES...  -- clone or fast-forward only.
+git_update() {
+    local dir=$1 repo=$2 branch=$3; shift 3
+    if ! as_app test -d "$dir/.git"; then
+        log "Cloning $repo"
+        retry as_app git clone --branch "$branch" "$repo" "$dir"
+        return
+    fi
+    # Build stamps the tools rewrite on every run; drift in them must not
+    # block the fast-forward.
+    local f
+    for f in "$@"; do as_app git -C "$dir" checkout -- "$f" 2>/dev/null || true; done
+    retry as_app git -C "$dir" fetch origin "$branch" \
+        || die "git fetch in $dir failed after retries (network?). Nothing after the backup has changed; re-run when the network is back."
+    # The packaged (.deb/.rpm) installs check out an exact commit, leaving a
+    # detached HEAD: move onto the branch when that loses nothing.
+    if ! as_app git -C "$dir" symbolic-ref -q HEAD >/dev/null; then
+        if as_app git -C "$dir" merge-base --is-ancestor HEAD "origin/$branch"; then
+            as_app git -C "$dir" checkout -q -B "$branch" "origin/$branch"
+            return
         fi
-    else
-        log "Cloning c4raven-server"
-        as_app git clone "$SERVER_REPO" "$SERVER_SRC_DIR"
+        die "$dir has a detached HEAD that isn't part of origin/$branch. Check it out onto $branch yourself, then re-run."
     fi
+    if [[ "$(as_app git -C "$dir" rev-parse --abbrev-ref HEAD)" != "$branch" ]]; then
+        die "$dir is on branch '$(as_app git -C "$dir" rev-parse --abbrev-ref HEAD)', not '$branch'. Switch it (git checkout $branch) or set SERVER_BRANCH/UI_BRANCH, then re-run."
+    fi
+    if ! as_app git -C "$dir" merge --ff-only -q "origin/$branch"; then
+        as_app git -C "$dir" status --short
+        die "$dir has local commits or modified files (above) that block a fast-forward to origin/$branch. Resolve them (commit/stash/push), then re-run."
+    fi
+}
 
+# ---- backend -------------------------------------------------------------------
+NEW_COMMIT="$PREV_COMMIT"
+if [[ "$SKIP_BACKEND" != 1 ]]; then
+    log "Updating c4raven-server"
+    git_update "$SERVER_SRC_DIR" "$SERVER_REPO" "$SERVER_BRANCH" raven/__init__.py
     NEW_COMMIT="$(as_app git -C "$SERVER_SRC_DIR" rev-parse --short HEAD)"
-    log "c4raven-server: ${PREV_COMMIT} -> ${NEW_COMMIT}"
+    if [[ "$NEW_COMMIT" != "$PREV_COMMIT" ]]; then fixed "c4raven-server $PREV_COMMIT -> $NEW_COMMIT"; else ok "c4raven-server already at $NEW_COMMIT"; fi
 
+    log "Installing Python dependencies"
     if [[ "$LAYOUT" == raven ]]; then
-        # install.sh built this venv with Poetry (in-project .venv); keep
-        # using it so the install follows poetry.lock exactly.
-        log "Installing into the venv (poetry install)"
-        as_app bash -c 'cd "$1" && poetry install' _ "$SERVER_SRC_DIR"
+        # install.sh built this venv with Poetry; keep following poetry.lock.
+        as_app_sh 'command -v poetry' >/dev/null 2>&1 \
+            || die "poetry isn't on the $APP_OWNER user's PATH. Run ./finish-install.sh, which reinstalls it."
+        retry as_app_sh "cd $(printf '%q' "$SERVER_SRC_DIR") && poetry install --no-interaction" \
+            || die "poetry install failed after retries (output above). The services are still running the previous code; fix the error (network, disk space) and re-run."
     else
-        log "Installing into the venv (editable)"
-        "$PIP" install -e "$SERVER_SRC_DIR"
+        retry as_app "$RAVEN_VENV/bin/pip" install -q -e "$SERVER_SRC_DIR" \
+            || die "pip install failed after retries (output above). The services are still running the previous code; re-run when fixed."
     fi
+    # poetry-dynamic-versioning rewrites this on install; keep the tree clean.
+    as_app git -C "$SERVER_SRC_DIR" checkout -- raven/__init__.py 2>/dev/null || true
+    ok "dependencies installed"
 else
     warn "SKIP_BACKEND=1 -- backend left untouched"
 fi
 
-# ---- update the frontend ----------------------------------------------------
-if [[ "$SKIP_UI" != "1" ]]; then
-    log "Updating c4raven-ui source"
-    if as_app test -d "$UI_SRC_DIR/.git"; then
-        # src/_versions.ts is a build stamp that `yarn build` rewrites every
-        # run; discard it so it can't block the fast-forward. yarn.lock too:
-        # it's generated, and a plain `yarn install` (install.sh ran one
-        # before the lockfile's workspace entry was fixed upstream) rewrites
-        # it locally, which blocks every later pull. The build below uses
-        # --immutable, so whatever origin/main's lockfile says is what's used.
-        as_app git -C "$UI_SRC_DIR" checkout -- src/_versions.ts yarn.lock 2>/dev/null || true
-        as_app git -C "$UI_SRC_DIR" fetch origin
-        if ! as_app git -C "$UI_SRC_DIR" merge --ff-only origin/main; then
-            as_app git -C "$UI_SRC_DIR" status --short
-            die "c4raven-ui has local commits or modified files (listed above) that block a fast-forward to origin/main. Resolve them in $UI_SRC_DIR, then re-run."
-        fi
+# ---- frontend ------------------------------------------------------------------
+UI_STAMP="$RAVEN_DATA_DIR/.ui-deployed-commit"
+NEW_UI_COMMIT="$PREV_UI_COMMIT"
+if [[ "$SKIP_UI" != 1 ]]; then
+    log "Updating c4raven-ui"
+    # yarn.lock: a plain `yarn install` rewrote it on some older installs and
+    # that blocks every later pull; the build uses --immutable anyway.
+    git_update "$UI_SRC_DIR" "$UI_REPO" "$UI_BRANCH" src/_versions.ts yarn.lock
+    NEW_UI_COMMIT="$(as_app git -C "$UI_SRC_DIR" rev-parse --short HEAD)"
+    DEPLOYED_UI="$(as_app cat "$UI_STAMP" 2>/dev/null || true)"
+    if [[ "$FORCE_UI_BUILD" != 1 && "$DEPLOYED_UI" == "$NEW_UI_COMMIT" ]] && as_root test -f "$UI_DEPLOY_DIR/index.html"; then
+        ok "UI $NEW_UI_COMMIT already built and deployed (FORCE_UI_BUILD=1 to rebuild)"
     else
-        as_app git clone "$UI_REPO" "$UI_SRC_DIR"
-    fi
-
-    log "Building UI"
-    # c4raven-ui pins yarn 4 via package.json's packageManager field;
-    # `corepack yarn` runs that exact version. There is no npm fallback:
-    # npm doesn't understand the yarn 4 lockfile and would corrupt it.
-    as_app bash -c 'command -v corepack' >/dev/null 2>&1 \
-        || die "corepack not found (needed to run the pinned yarn 4). Install Node with corepack, or: sudo npm install -g corepack"
-    as_app bash -c 'cd "$1" && corepack yarn install --immutable && corepack yarn build' _ "$UI_SRC_DIR"
-
-    log "Deploying UI to $UI_DEPLOY_DIR"
-    # --no-perms/--no-owner/--no-group/--omit-dir-times: don't try to set
-    # metadata on the webroot itself (we may not own it), which is the only
-    # thing that used to make rsync exit 23 here. Everything else is a real
-    # failure and must not be swallowed -- a half-deployed UI plus a service
-    # restart is worse than stopping.
-    as_owner_root rsync -a --no-perms --no-owner --no-group --omit-dir-times --delete \
-        "$UI_SRC_DIR/dist/" "$UI_DEPLOY_DIR/" || die "UI deploy to $UI_DEPLOY_DIR failed (rsync exit $?)"
-    if [[ "$LAYOUT" == raven ]]; then
-        sudo chown -R "$RAVEN_USER:$RAVEN_USER" "$UI_DEPLOY_DIR"
-    fi
-    # SELinux (Rocky/RHEL, enforcing by default) labels files by the type
-    # rule for the path they're created under. rsync into a webroot that
-    # isn't the distro default gets that wrong often enough that nginx then
-    # 403s every asset, so relabel from the policy. No-op where SELinux
-    # isn't in use (restorecon doesn't exist on Debian/Ubuntu).
-    if command -v restorecon >/dev/null 2>&1; then
-        sudo restorecon -R "$UI_DEPLOY_DIR" >/dev/null 2>&1 || true
+        as_app_sh 'command -v corepack' >/dev/null 2>&1 \
+            || die "corepack not found (needed for the yarn version c4raven-ui pins). Install Node 22 with corepack, or: sudo npm install -g corepack"
+        log "Building UI $NEW_UI_COMMIT"
+        retry as_app_sh "cd $(printf '%q' "$UI_SRC_DIR") && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack yarn install --immutable" \
+            || die "yarn install failed after retries (output above). The old UI is still deployed."
+        if ! as_app_sh "cd $(printf '%q' "$UI_SRC_DIR") && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack yarn build"; then
+            free -h 2>/dev/null || true
+            die "The UI build failed (output above); the old UI is still deployed. If it was killed, the machine is short of memory: add 2 GB of swap and re-run."
+        fi
+        as_app git -C "$UI_SRC_DIR" checkout -- src/_versions.ts 2>/dev/null || true
+        as_root test -f "$UI_SRC_DIR/dist/index.html" || die "The UI build produced no dist/index.html; the old UI is still deployed."
+        log "Deploying UI to $UI_DEPLOY_DIR"
+        as_root mkdir -p "$UI_DEPLOY_DIR"
+        as_root rsync -a --no-perms --no-owner --no-group --omit-dir-times --delete \
+            "$UI_SRC_DIR/dist/" "$UI_DEPLOY_DIR/" || die "UI deploy to $UI_DEPLOY_DIR failed (rsync exit $?)"
+        [[ "$LAYOUT" == raven ]] && as_root chown -R "$RAVEN_USER:$RAVEN_USER" "$UI_DEPLOY_DIR"
+        # SELinux (EL): files rsync creates under /var/www get the wrong label
+        # and nginx 403s them. No-op where restorecon doesn't exist.
+        command -v restorecon >/dev/null 2>&1 && { as_root restorecon -R "$UI_DEPLOY_DIR" >/dev/null 2>&1 || true; }
+        as_app_sh "printf '%s\n' $(printf '%q' "$NEW_UI_COMMIT") > $(printf '%q' "$UI_STAMP")" || true
+        fixed "UI $PREV_UI_COMMIT -> $NEW_UI_COMMIT deployed"
     fi
 else
     warn "SKIP_UI=1 -- frontend left untouched"
 fi
 
-# ---- restart and verify ------------------------------------------------------
-# Federation Hub (optional, raven layout) talks to the backend's API; restart
-# it with the rest when it's running, as c4raven-server-setup's update.sh does.
-if [[ "$LAYOUT" == raven ]] && systemctl is-active --quiet federation-hub 2>/dev/null; then
-    RAVEN_SERVICES="$RAVEN_SERVICES federation-hub.service"
+# ---- settings -------------------------------------------------------------------
+log "Settings"
+if out=$(config_add_keys "$PYTHON" "$RAVEN_DATA_DIR/config.yml" "$APP_OWNER" "$RAVEN_HOME/.raven-secrets.env"); then
+    if [[ -n "$out" ]]; then fixed "config.yml: added $(echo "$out" | tr '\n' ' ')"; else ok "config.yml left as it is (new settings use the code's defaults)"; fi
+else
+    warn "could not add new settings to config.yml (above); the built-in defaults apply"
 fi
-# A server whose install.sh stopped early has no raven.service at all (the
-# units are written near the very end of install.sh), so there is nothing to
-# restart and no backend to log in to. Finish the install instead: that
-# writes the missing units, starts everything and tests a login.
-if [[ "$LAYOUT" == raven ]] && ! systemctl cat raven.service >/dev/null 2>&1; then
-    warn "raven.service doesn't exist: this server's install.sh never finished. Running finish-install.sh to complete it."
-    exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/finish-install.sh"
+# MediaMTX's webhook token: a mediamtx.yml still holding the placeholder
+# makes every stream's auth callback fail.
+MTX_YML="$RAVEN_DATA_DIR/mediamtx/mediamtx.yml"
+if as_root test -f "$MTX_YML" && as_root grep -q MTX_TOKEN "$MTX_YML"; then
+    tok="$(config_get "$PYTHON" "$RAVEN_DATA_DIR/config.yml" "$APP_OWNER" RAVEN_MEDIAMTX_TOKEN)"
+    if [[ -n "$tok" ]]; then
+        as_root sed -i "s~MTX_TOKEN~$tok~g" "$MTX_YML"
+        fixed "filled in MediaMTX's webhook token"
+    fi
+fi
+
+# ---- database --------------------------------------------------------------------
+MAIN_SERVICE="${RAVEN_SERVICES%% *}"
+# Units that run backend code: stop them so nothing queries a half-migrated
+# schema (mediamtx and federation-hub can stay up).
+APP_UNITS=""
+for u in $RAVEN_SERVICES; do
+    case "$u" in mediamtx*|federation-hub*) ;; *) APP_UNITS="$APP_UNITS $u" ;; esac
+done
+log "Migrating the database"
+if [[ "$HAS_SYSTEMD" == 1 ]]; then
+    # shellcheck disable=SC2086
+    as_root systemctl stop $APP_UNITS 2>/dev/null || true
+else
+    warn "no systemd: migrating while the services keep running; restart them afterwards"
+fi
+MIGRATE_OK=1
+db_migrate "$APP_OWNER" "$RAVEN_VENV" "$RAVEN_DATA_DIR" "$WORKDIR" || MIGRATE_OK=0
+if [[ "$MIGRATE_OK" == 0 ]]; then
+    warn "DATABASE MIGRATION FAILED. The services are being started anyway (they retry the migration on startup). To roll back, see README.md 'Rolling back' with $BACKUP_DIR."
+fi
+
+# ---- nginx -----------------------------------------------------------------------
+if [[ "$SKIP_NGINX" != 1 ]]; then
+    log "Applying nginx template fixes"
+    nginx_harden || true
+fi
+
+fix_log_ownership "$APP_OWNER" "$RAVEN_DATA_DIR/logs" "$MAIN_LOG" || true
+
+# ---- restart and verify ------------------------------------------------------------
+if [[ "$LAYOUT" == raven ]] && unit_active federation-hub; then
+    RAVEN_SERVICES="$RAVEN_SERVICES federation-hub.service"
 fi
 log "Restarting: $RAVEN_SERVICES"
 # shellcheck disable=SC2086
-sudo systemctl restart $RAVEN_SERVICES
+svc restart $RAVEN_SERVICES || warn "systemctl restart reported an error"
 
-log "Waiting for the service to come up (migrations run on startup)"
-MAIN_SERVICE="${RAVEN_SERVICES%% *}"
-for i in $(seq 1 "$HEALTH_TRIES"); do
-    if curl -sk -o /dev/null -w '%{http_code}' "$HEALTH_URL" 2>/dev/null | grep -q '^200$'; then
-        log "Healthy: $HEALTH_URL returned 200"
-        break
+HEALTHY=0
+if [[ "$HAS_SYSTEMD" == 1 ]] || curl -s -o /dev/null --max-time 3 "$HEALTH_URL"; then
+    log "Waiting for $HEALTH_URL"
+    if wait_healthy "$HEALTH_URL" "$HEALTH_TRIES"; then
+        HEALTHY=1; ok "healthy: $HEALTH_URL returned 200"
+    else
+        warn "no 200 from $HEALTH_URL after $((HEALTH_TRIES * 2))s. Check: sudo journalctl -u $MAIN_SERVICE -n 100, and $RAVEN_DATA_DIR/logs/"
     fi
-    if [[ "$i" -eq "$HEALTH_TRIES" ]]; then
-        warn "Service did not report healthy after $((HEALTH_TRIES * 2))s. Check: sudo journalctl -u $MAIN_SERVICE -n 100"
-    fi
-    sleep 2
-done
+fi
+if [[ "$HAS_SYSTEMD" == 1 ]]; then
+    for s in $RAVEN_SERVICES; do
+        st="$(unit_state "$s")"
+        [[ "$st" == active ]] || warn "$s is $st -- check: sudo journalctl -u $s -n 100"
+    done
+fi
 
-for svc in $RAVEN_SERVICES; do
-    state="$(systemctl is-active "$svc" 2>/dev/null || echo unknown)"
-    if [[ "$state" != "active" ]]; then
-        warn "$svc is $state -- check: sudo journalctl -u $svc -n 100"
-    fi
-done
+DB_REV_AFTER="$(db_revisions "$APP_OWNER" "$RAVEN_VENV" "$RAVEN_DATA_DIR" "$WORKDIR" current || true)"
+DB_HEAD="$(db_revisions "$APP_OWNER" "$RAVEN_VENV" "$RAVEN_DATA_DIR" "$WORKDIR" heads || true)"
+if [[ -n "$DB_HEAD" && "$DB_REV_AFTER" == "$DB_HEAD" ]]; then
+    ok "database at head ($DB_HEAD)"
+else
+    warn "database is at '${DB_REV_AFTER:-?}', code head is '${DB_HEAD:-?}'"
+fi
+# New scheduled jobs reach the job store when the app starts (raven/app.py
+# add_new_jobs_to_config); confirm the ones this release added are there.
+if [[ "$HEALTHY" == 1 && "$DB_URI" == postgresql* ]]; then
+    sleep 3
+    jobs="$(as_app "$PYTHON" -c '
+import sys, sqlalchemy as sa
+e = sa.create_engine(sys.argv[1])
+with e.connect() as c:
+    print(" ".join(r[0] for r in c.execute(sa.text("SELECT id FROM apscheduler_jobs"))))
+' "$DB_URI" 2>/dev/null || true)"
+    # Space-separated; extend when a release adds scheduled jobs.
+    NEW_JOBS="expire_group_memberships"
+    for j in $NEW_JOBS; do
+        if as_app grep -q "\"$j\"" "$SERVER_SRC_DIR/raven/defaultconfig.py" 2>/dev/null; then
+            case " $jobs " in
+                *" $j "*) ok "scheduled job $j registered" ;;
+                *) warn "scheduled job $j is not in the job store yet (it is added when $MAIN_SERVICE starts; check its log)" ;;
+            esac
+        fi
+    done
+fi
 
+echo
+echo "Update finished ($LAYOUT layout)."
+echo
 cat <<EOF
-
-Update finished ($LAYOUT layout).
-
 Backup:          $BACKUP_DIR
-Backend before:  ${PREV_COMMIT}
-Backend after:   ${NEW_COMMIT:-unchanged}
-
-If anything looks wrong, see README.md for how to roll back from the
-backup directory above.
+Backend:         $PREV_COMMIT -> $NEW_COMMIT
+UI:              $PREV_UI_COMMIT -> $NEW_UI_COMMIT
+Database:        ${DB_REV_BEFORE:-?} -> ${DB_REV_AFTER:-?}
 EOF
+print_summary
+echo
+echo "If anything looks wrong, README.md 'Rolling back' explains how to restore from the backup above."
+[[ "$MIGRATE_OK" == 1 ]] || exit 1
