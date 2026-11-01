@@ -16,6 +16,18 @@ LOGIN_USER="${LOGIN_USER:-administrator}"
 LOGIN_PASS="${LOGIN_PASS:-password}"
 
 h() { printf '\n===== %s\n' "$1"; }
+# Root in a container often has no sudo binary; stand in for the two forms
+# used below (`sudo CMD` and `sudo -u USER [-H] CMD`).
+if [ "$(id -u)" = 0 ] && ! command -v sudo >/dev/null 2>&1; then
+  sudo() {
+    if [ "$1" = -u ]; then
+      local u=$2; shift 2; [ "$1" = -H ] && shift
+      runuser -u "$u" -- "$@"
+    else
+      "$@"
+    fi
+  }
+fi
 as_raven() { sudo -u raven -H bash -lc "cd / && $1"; }
 
 # Reading config.yml needs PyYAML, which is a dependency of the backend and
@@ -69,7 +81,7 @@ done
 h "Code versions"
 echo "server: $(as_raven "git -C $RAVEN_HOME/c4raven-server log -1 --format='%h %cd %s' --date=short" 2>&1)"
 echo "ui:     $(as_raven "git -C $RAVEN_HOME/c4raven-ui log -1 --format='%h %cd %s' --date=short" 2>&1)"
-echo "ui files deployed: $(ls /var/www/html/raven 2>/dev/null | wc -l) (index.html: $(test -f /var/www/html/raven/index.html && echo yes || echo NO))"
+echo "ui files deployed: $(find /var/www/html/raven -mindepth 1 -maxdepth 1 2>/dev/null | wc -l) (index.html: $(test -f /var/www/html/raven/index.html && echo yes || echo NO))"
 
 h "Settings that affect login (no secrets)"
 as_raven "$RAVEN_PY - '$DATA/config.yml'" <<'EOF'
@@ -84,7 +96,19 @@ for k in ["RAVEN_TURNSTILE_ENABLE", "RAVEN_ENABLE_EMAIL", "RAVEN_ENABLE_LDAP",
 print("SECRET_KEY set:", bool(c.get("SECRET_KEY")), "| SECURITY_PASSWORD_SALT set:", bool(c.get("SECURITY_PASSWORD_SALT")))
 print("database:", c.get("SQLALCHEMY_DATABASE_URI", "").split("@")[-1])
 EOF
+echo "connection profile requires client cert/Basic auth: $(as_raven "$RAVEN_PY -c \"import yaml; print(yaml.safe_load(open('$DATA/config.yml')).get('RAVEN_CONNECTION_PROFILE_REQUIRE_AUTH', '(not set: default True)'))\"" 2>&1)"
 echo "secrets env keys: $(sudo cut -d= -f1 "$RAVEN_HOME/.raven-secrets.env" 2>/dev/null | tr '\n' ' ')"
+
+h "Database schema"
+RAVEN_VENV_DIR=$(dirname "$(dirname "$RAVEN_PY")")
+MIG=$(as_raven "$RAVEN_PY -c 'import os, raven; print(os.path.join(os.path.dirname(os.path.realpath(raven.__file__)), \"migrations\"))'" 2>/dev/null | tail -1)
+if [ -n "$MIG" ] && sudo test -x "$RAVEN_VENV_DIR/bin/flask"; then
+  cur=$(as_raven "cd $DATA && FLASK_APP=raven.app RAVEN_DATA_FOLDER=$DATA $RAVEN_VENV_DIR/bin/flask db current -d $MIG" 2>/dev/null | grep -oE '^[0-9a-f]{12}' | tr '\n' ' ')
+  head=$(as_raven "cd $DATA && FLASK_APP=raven.app RAVEN_DATA_FOLDER=$DATA $RAVEN_VENV_DIR/bin/flask db heads -d $MIG" 2>/dev/null | grep -oE '^[0-9a-f]{12}' | tr '\n' ' ')
+  echo "database at: ${cur:-?} | code head: ${head:-?} $([ -n "$cur" ] && [ "$cur" = "$head" ] && echo '(up to date)' || echo '(NOT at head: run ./update.sh)')"
+else
+  echo "(could not locate the backend's flask/migrations)"
+fi
 
 h "Accounts"
 DBNAME=$(as_raven "$RAVEN_PY -c \"import yaml; print(yaml.safe_load(open('$DATA/config.yml'))['SQLALCHEMY_DATABASE_URI'].rsplit('/',1)[-1])\"" 2>/dev/null)
@@ -173,6 +197,11 @@ else
   sudo grep -RnE 'server_name|listen|ssl_certificate |return 301|managed by Certbot' "${NGINX_DIRS[@]}" 2>&1
 fi
 sudo nginx -t 2>&1 | tail -2
+# Non-mTLS blocks must blank X-Ssl-Cert (update.sh applies this).
+for f in /etc/nginx/sites-available/raven_http /etc/nginx/sites-available/raven_certificate_enrollment /etc/nginx/conf.d/raven_http.conf /etc/nginx/conf.d/raven_certificate_enrollment.conf; do
+  sudo test -f "$f" || continue
+  if sudo grep -q 'X-Ssl-Cert ""' "$f"; then echo "$f: clears client X-Ssl-Cert (ok)"; else echo "$f: does NOT clear X-Ssl-Cert -- run ./update.sh"; fi
+done
 
 h "Certificates"
 sudo certbot certificates 2>/dev/null | grep -E 'Certificate Name|Domains|Expiry' || echo "(certbot has no certificates)"
