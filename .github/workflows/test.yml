@@ -1,0 +1,61 @@
+name: Test
+
+# Lint on every push; on master pushes, pull requests and by hand, also run
+# tests/docker-scenarios.sh: a real install.sh install of the current
+# c4raven-server / c4raven-ui main in a systemd container, then update.sh,
+# finish-install.sh and the no-systemd fallbacks against it.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          shellcheck --version | sed -n 2p
+          shellcheck -x update.sh finish-install.sh diagnose-login.sh lib/common.sh tests/docker-scenarios.sh
+
+  scenarios:
+    needs: lint
+    if: github.event_name != 'push' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/ci')
+    name: scenarios / ${{ matrix.distro }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [ubuntu-24.04, rocky-9]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: C4-Raven/c4raven-server-setup
+          ref: master
+          path: setup
+      - name: Reclaim disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+      - name: Run the scenarios
+        run: tests/docker-scenarios.sh "$GITHUB_WORKSPACE/setup" "${{ matrix.distro }}"
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.distro }}
+          path: tests/.artifacts/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
