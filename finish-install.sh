@@ -355,20 +355,90 @@ fi
 # The plugins must be enabled BEFORE rabbitmq.conf names their settings:
 # RabbitMQ refuses to start on settings it has no schema for.
 log "RabbitMQ"
-# Earlier installers pinned PLUGINS_DIR in rabbitmq-env.conf to
-# rabbitmq_server-<ver>/plugins, taking <ver> from rabbitmqadmin, which need
-# not match the broker -- and upgrading rabbitmq-server removes that directory
-# anyway. rabbitmq-plugins then dies with plugins_dir_does_not_exist and the
-# broker cannot load its plugins. The package's own wrapper already exports
-# the right directory when PLUGINS_DIR is unset, so drop the pinned line.
-if as_root test -f /etc/rabbitmq/rabbitmq-env.conf \
-   && as_root grep -qs '^PLUGINS_DIR="/usr/lib/rabbitmq/plugins:/usr/lib/rabbitmq/lib/rabbitmq_server-' /etc/rabbitmq/rabbitmq-env.conf; then
-  as_root sed -i '\|^PLUGINS_DIR="/usr/lib/rabbitmq/plugins:/usr/lib/rabbitmq/lib/rabbitmq_server-[^"]*/plugins"$|d' /etc/rabbitmq/rabbitmq-env.conf \
-    || die "could not remove the stale PLUGINS_DIR line from /etc/rabbitmq/rabbitmq-env.conf"
-  fixed "removed a stale pinned PLUGINS_DIR from /etc/rabbitmq/rabbitmq-env.conf"
+# Find the directory holding the broker's bundled plugins (rabbitmq_mqtt and
+# rabbitmq_auth_backend_http ship with rabbitmq-server) and hand it to
+# rabbitmq-plugins explicitly as RABBITMQ_PLUGINS_DIR, which wins over
+# anything in rabbitmq-env.conf. Earlier installers pinned PLUGINS_DIR there
+# to rabbitmq_server-<ver>/plugins with <ver> taken from rabbitmqadmin, which
+# need not match the broker and is removed by the next rabbitmq-server
+# upgrade either way; rabbitmq-plugins then dies with
+# plugins_dir_does_not_exist. Those lines, and any plugin-dir line naming no
+# directory that exists, are dropped: the package derives the right one.
+rabbit_pkg_version() {
+  if command -v dpkg-query >/dev/null 2>&1 && dpkg-query -W rabbitmq-server >/dev/null 2>&1; then
+    dpkg-query -W -f='${Version}' rabbitmq-server 2>/dev/null || true
+  else
+    rpm -q --qf '%{VERSION}' rabbitmq-server 2>/dev/null || true
+  fi
+}
+rabbit_plugins_dir() {
+  local v d
+  v=$(rabbit_pkg_version); v=${v#*:}; v=${v%%-*}; v=${v%%~*}
+  for d in "/usr/lib/rabbitmq/lib/rabbitmq_server-$v/plugins" \
+           $(ls -d /usr/lib/rabbitmq/lib/rabbitmq_server-*/plugins 2>/dev/null | sort -rV); do
+    if compgen -G "$d/rabbitmq_mqtt-*" >/dev/null && compgen -G "$d/rabbitmq_auth_backend_http-*" >/dev/null; then
+      printf '%s' "$d"; return 0
+    fi
+  done
+  return 0
+}
+rabbit_diagnostics() {
+  echo "--- RabbitMQ diagnostics ---" >&2
+  echo "package version: $(rabbit_pkg_version)" >&2
+  ls -la /usr/lib/rabbitmq/lib/ >&2 2>&1 || true
+  echo "plugin-dir settings in /etc/rabbitmq/rabbitmq-env.conf:" >&2
+  as_root grep -nE '^[[:space:]]*(export[[:space:]]+)?(RABBITMQ_)?PLUGINS_DIR=' /etc/rabbitmq/rabbitmq-env.conf >&2 2>&1 || echo "  (none)" >&2
+  env | grep -E '^(RABBITMQ_)?PLUGINS_DIR=' >&2 || true
+  echo "----------------------------" >&2
+}
+RABBIT_ENV=/etc/rabbitmq/rabbitmq-env.conf
+if as_root test -f "$RABBIT_ENV"; then
+  rabbit_env_new=$(mktemp)
+  rabbit_env_dropped=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?(RABBITMQ_)?PLUGINS_DIR=(.*)$ ]]; then
+      val=${BASH_REMATCH[3]}; val=${val//\"/}; val=${val//\'/}
+      drop=1
+      case "$val" in
+        */usr/lib/rabbitmq/lib/rabbitmq_server-*) ;;
+        *) IFS=: read -ra parts <<< "$val"
+           for p in "${parts[@]}"; do if [ -n "$p" ] && [ -d "$p" ]; then drop=0; fi; done ;;
+      esac
+      if [ "$drop" = 1 ]; then
+        echo "dropping from $RABBIT_ENV: $line"
+        rabbit_env_dropped=1
+        continue
+      fi
+    fi
+    printf '%s\n' "$line" >> "$rabbit_env_new"
+  done < <(as_root cat "$RABBIT_ENV")
+  if [ "$rabbit_env_dropped" = 1 ]; then
+    as_root cp -p "$RABBIT_ENV" "$RABBIT_ENV.bak-$(date +%Y%m%d%H%M%S)"
+    as_root cp "$rabbit_env_new" "$RABBIT_ENV"
+    fixed "removed a stale plugin-directory setting from $RABBIT_ENV (backup kept next to it)"
+  fi
+  rm -f "$rabbit_env_new"
 fi
-as_root rabbitmq-plugins enable --offline rabbitmq_mqtt rabbitmq_auth_backend_http >/dev/null \
-  || die "rabbitmq-plugins could not enable rabbitmq_mqtt / rabbitmq_auth_backend_http (output above)."
+unset PLUGINS_DIR RABBITMQ_PLUGINS_DIR
+RABBIT_PLUGINS_DIR=$(rabbit_plugins_dir)
+if [ -z "$RABBIT_PLUGINS_DIR" ]; then
+  warn "RabbitMQ's plugin files are missing; reinstalling rabbitmq-server"
+  if [ "$PKG_MGR" = apt ]; then
+    retry as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -q --reinstall rabbitmq-server || true
+  else
+    retry as_root dnf reinstall -y -q rabbitmq-server || true
+  fi
+  RABBIT_PLUGINS_DIR=$(rabbit_plugins_dir)
+  if [ -n "$RABBIT_PLUGINS_DIR" ]; then fixed "reinstalled rabbitmq-server (its plugin files were missing)"; fi
+fi
+if [ -z "$RABBIT_PLUGINS_DIR" ]; then
+  rabbit_diagnostics
+  die "RabbitMQ's plugin files are missing: no /usr/lib/rabbitmq/lib/rabbitmq_server-*/plugins holds rabbitmq_mqtt. Reinstall it (sudo apt-get install --reinstall rabbitmq-server, or dnf reinstall rabbitmq-server) and re-run."
+fi
+if ! as_root env RABBITMQ_PLUGINS_DIR="$RABBIT_PLUGINS_DIR" rabbitmq-plugins enable --offline rabbitmq_mqtt rabbitmq_auth_backend_http; then
+  rabbit_diagnostics
+  die "rabbitmq-plugins could not enable rabbitmq_mqtt / rabbitmq_auth_backend_http (output and diagnostics above)."
+fi
 want="$(mktemp)"
 cat > "$want" <<'EOF'
 mqtt.listeners.tcp.default = 1883
