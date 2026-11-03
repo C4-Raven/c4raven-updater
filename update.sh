@@ -108,7 +108,13 @@ WORKDIR="$SERVER_SRC_DIR"
 
 # One run at a time (finish-install.sh, when called from here, shares it).
 if [[ -z "${RAVEN_UPDATER_LOCKED:-}" ]] && command -v flock >/dev/null 2>&1; then
-    exec 9>"${TMPDIR:-/tmp}/c4raven-updater.lock"
+    # Lock on a read-only descriptor: flock works on one, and fs.protected_regular
+    # stops root opening another user's existing /tmp file for writing (O_CREAT),
+    # so `exec 9>` failed under sudo whenever an earlier non-sudo run had left the
+    # lock file behind ("Permission denied").
+    RAVEN_LOCK="${TMPDIR:-/tmp}/c4raven-updater.lock"
+    [[ -e "$RAVEN_LOCK" ]] || (umask 000; : > "$RAVEN_LOCK") 2>/dev/null || true
+    { exec 9<"$RAVEN_LOCK"; } 2>/dev/null || die "Cannot open the lock file $RAVEN_LOCK (delete it and re-run)."
     flock -n 9 || die "Another update.sh / finish-install.sh is already running."
     export RAVEN_UPDATER_LOCKED=1
 fi
