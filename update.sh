@@ -14,6 +14,8 @@
 #   6. applies the current nginx template fixes to the existing site files
 #      (backup, nginx -t, roll back on failure)
 #   7. starts everything again, health-checks it and prints a summary
+#   8. checks Federation Hub (install-fedhub.sh --check): offers to install
+#      it when missing, reconnects Raven when needed (legacy layout: report only)
 #
 # Safe to re-run: every step checks first and skips what is already current.
 # It never drops or truncates the database, never deletes anything in the
@@ -151,6 +153,8 @@ if [[ "$LAYOUT" == raven ]]; then
     if [[ -n "$incomplete" ]]; then
         warn "This server's install never finished ($incomplete). Running finish-install.sh first."
         "$HERE/finish-install.sh" || die "finish-install.sh could not complete the install (see above); fix that and re-run."
+        # Its last step was the Federation Hub section; don't ask again below.
+        export RAVEN_FEDHUB_SECTION_DONE=1
     fi
 fi
 
@@ -160,6 +164,8 @@ if [[ "$LAYOUT" == offline ]]; then
     out=$(config_add_keys "$PYTHON" "$RAVEN_DATA_DIR/config.yml" "$APP_OWNER" "$RAVEN_HOME/.raven-secrets.env") || warn "could not add new settings to config.yml"
     [[ -n "${out:-}" ]] && fixed "config.yml: added $(echo "$out" | tr '\n' ' ')"
     [[ "$SKIP_NGINX" == 1 ]] || nginx_harden || true
+    export RAVEN_USER="$APP_OWNER" RAVEN_HOME RAVEN_DATA_DIR RAVEN_VENV
+    fedhub_section offline
     echo
     print_summary
     cat <<EOF
@@ -425,6 +431,16 @@ with e.connect() as c:
         fi
     done
 fi
+
+# ---- Federation Hub ---------------------------------------------------------------
+# Never fails the update. Legacy layout: check only (its Federation Hub was set
+# up by hand and is left exactly as it is).
+if [[ "$LAYOUT" == legacy ]]; then
+    export RAVEN_USER="$APP_OWNER" RAVEN_DATA_DIR RAVEN_VENV RAVEN_SECRETS_FILE="" RAVEN_MAIN_UNIT=opentakserver
+else
+    export RAVEN_USER="$APP_OWNER" RAVEN_HOME RAVEN_DATA_DIR RAVEN_VENV
+fi
+fedhub_section "$LAYOUT"
 
 echo
 echo "Update finished ($LAYOUT layout)."

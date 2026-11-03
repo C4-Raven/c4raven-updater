@@ -14,7 +14,8 @@
 #   certificate authority and server certificate, MediaMTX (binary, config,
 #   webhook token, unit), nginx sites/streams (+ current hardening), the web
 #   UI, RabbitMQ plugins/config, the secrets file, the systemd units, starting
-#   everything, the first administrator account, and a test login.
+#   everything, the first administrator account, a test login, and Federation
+#   Hub (install-fedhub.sh: offered when missing, reconnected when needed).
 #
 # Idempotent: on a complete install it changes nothing (apart from restarting
 # services that are not running). It never drops or empties the database,
@@ -660,6 +661,11 @@ EOF
          echo "    (expected if the password was already changed; log in with the new one)" ;;
   esac
 fi
+
+# ---- 12. Federation Hub --------------------------------------------------------------------------
+# Offered (or reconnected) last, once Raven itself is up; never fails this script.
+export RAVEN_USER="$APP_USER" RAVEN_HOME="$APP_HOME" RAVEN_DATA_DIR="$DATA_DIR" RAVEN_VENV="$VENV"
+fedhub_section raven
 
 echo
 echo "finish-install.sh done."

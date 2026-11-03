@@ -86,9 +86,9 @@ retry() {
 # ---- distro facts -------------------------------------------------------------
 # The same facts c4raven-server-setup's lib/distro.sh derives, kept minimal.
 DISTRO_FAMILY=debian
-if [ -r /etc/os-release ]; then
-  # shellcheck disable=SC1091
-  . /etc/os-release
+if [ -r "${OS_RELEASE:-/etc/os-release}" ]; then
+  # shellcheck disable=SC1090,SC1091
+  . "${OS_RELEASE:-/etc/os-release}"
   case " ${ID:-} ${ID_LIKE:-} " in
     *" rhel "*|*" fedora "*|*" centos "*|*" rocky "*|*" almalinux "*) DISTRO_FAMILY=rhel ;;
   esac
@@ -127,8 +127,11 @@ pkg_install() {
 # no service manager to restart anything with. Don't crash on that: do every
 # step that doesn't need it, and list what the user has to (re)start by hand.
 # RAVEN_NO_SYSTEMD=1 forces this mode (tests use it).
+# RAVEN_ASSUME_SYSTEMD=1 (tests, with a stub systemctl) forces the opposite.
 HAS_SYSTEMD=0
-if [ "${RAVEN_NO_SYSTEMD:-0}" != 1 ] && [ -d /run/systemd/system ] \
+if [ "${RAVEN_ASSUME_SYSTEMD:-0}" = 1 ]; then
+  HAS_SYSTEMD=1
+elif [ "${RAVEN_NO_SYSTEMD:-0}" != 1 ] && [ -d /run/systemd/system ] \
    && [ "$(cat /proc/1/comm 2>/dev/null)" = systemd ] && command -v systemctl >/dev/null 2>&1; then
   HAS_SYSTEMD=1
 fi
@@ -440,6 +443,76 @@ wait_healthy() {
     sleep 2
   done
   return 1
+}
+
+# ---- Federation Hub ---------------------------------------------------------------
+# fedhub_skip_requested -- 0 when the environment says "no Federation Hub",
+# with the same precedence as c4raven-server-setup's ih_fedhub_skip_requested
+# (install.sh): RAVEN_FEDHUB_SKIP=1; else RAVEN_FEDHUB_ARTIFACT set but empty
+# (a non-empty one means "install this"); else, with RAVEN_FEDHUB_ARTIFACT
+# unset, the legacy RAVEN_FEDHUB_DEB set but empty.
+fedhub_skip_requested() {
+  [ "${RAVEN_FEDHUB_SKIP:-0}" = 1 ] && return 0
+  if [ -n "${RAVEN_FEDHUB_ARTIFACT+x}" ]; then
+    [ -z "$RAVEN_FEDHUB_ARTIFACT" ]
+    return
+  fi
+  [ -n "${RAVEN_FEDHUB_DEB+x}" ] && [ -z "$RAVEN_FEDHUB_DEB" ]
+}
+
+# fedhub_section LAYOUT -- the last step of update.sh and finish-install.sh:
+# `install-fedhub.sh --check`, then install (asking, on a terminal) when it
+# is missing, or reconnect Raven when it isn't connected. Never fails the
+# caller: a Federation Hub problem is a warning with the command to retry.
+# On the legacy layout it only reports; that box's working Federation Hub
+# setup is not rewritten automatically. Callers export RAVEN_USER,
+# RAVEN_HOME, RAVEN_DATA_DIR and RAVEN_VENV first. fedhub_skip_requested
+# (below) skips it.
+#
+# Runs once per run: it exports RAVEN_FEDHUB_SECTION_DONE=1, and returns at
+# once when that is already set -- update.sh sets it after running
+# finish-install.sh (whose last step is this section), so a half-finished
+# install is not asked about Federation Hub twice.
+fedhub_section() {
+  local layout=${1:-raven} script="${FEDHUB_SCRIPT:-$HERE/install-fedhub.sh}" rc=0 rc2=0 out declined
+  [ "${RAVEN_FEDHUB_SECTION_DONE:-0}" = 1 ] && return 0
+  export RAVEN_FEDHUB_SECTION_DONE=1
+  fedhub_skip_requested && return 0
+  log "Federation Hub"
+  if [ ! -f "$script" ]; then warn "$script is missing; Federation Hub not checked"; return 0; fi
+  out=$(bash "$script" --check 2>&1) || rc=$?
+  [ -n "$out" ] && printf '    %s\n' "$out"
+  case "$rc" in
+    0) ok "Federation Hub installed and Raven connected to it" ;;
+    2) ;;
+    3)
+      declined=$(as_root sed -n 's/^RAVEN_FEDHUB_DECLINED=//p' "${RAVEN_HOME:-/opt/raven}/.install-answers" 2>/dev/null | tail -n 1 || true)
+      if [ "$layout" = legacy ]; then
+        warn "Federation Hub is not installed (legacy layout: not installed automatically). To install it: $script --artifact /path/to/takserver-fed-hub_<ver>_all.deb"
+      elif [ "$declined" = 1 ]; then
+        ok "Federation Hub not installed (you answered 'never'; to install it: $script --artifact PATH)"
+      elif { : < "${FEDHUB_TTY:-/dev/tty}"; } 2>/dev/null; then
+        echo "    Federation Hub isn't installed. If you have downloaded it from tak.gov, it can be installed now."
+        bash "$script" || rc2=$?
+        case "$rc2" in
+          0) fixed "installed Federation Hub and connected Raven to it" ;;
+          2) ok "Federation Hub skipped" ;;
+          *) warn "Federation Hub install failed (exit $rc2; output above). Raven itself is fine. Retry with: $script --artifact /path/to/the/release" ;;
+        esac
+      else
+        warn "Federation Hub is not installed. Download it from tak.gov (the .deb, or the Docker .zip), then run: $script --artifact /path/to/the/file"
+      fi ;;
+    4)
+      if [ "$layout" = legacy ]; then
+        warn "Federation Hub is installed but Raven's settings don't match it (above). Legacy layout: nothing was changed. Check the RAVEN_FEDHUB_* settings in ${RAVEN_DATA_DIR:-config.yml}/config.yml and that $(id -un) can read the certificates they name (README.md 'Federation Hub')."
+      else
+        bash "$script" --yes || rc2=$?
+        if [ "$rc2" = 0 ]; then fixed "reconnected Raven to Federation Hub"
+        else warn "reconnecting Raven to Federation Hub failed (exit $rc2; output above). Retry with: $script --yes"; fi
+      fi ;;
+    *) warn "could not check Federation Hub (exit $rc). Run: $script --check" ;;
+  esac
+  return 0
 }
 
 print_summary() {
