@@ -355,6 +355,18 @@ fi
 # The plugins must be enabled BEFORE rabbitmq.conf names their settings:
 # RabbitMQ refuses to start on settings it has no schema for.
 log "RabbitMQ"
+# Earlier installers pinned PLUGINS_DIR in rabbitmq-env.conf to
+# rabbitmq_server-<ver>/plugins, taking <ver> from rabbitmqadmin, which need
+# not match the broker -- and upgrading rabbitmq-server removes that directory
+# anyway. rabbitmq-plugins then dies with plugins_dir_does_not_exist and the
+# broker cannot load its plugins. The package's own wrapper already exports
+# the right directory when PLUGINS_DIR is unset, so drop the pinned line.
+if as_root test -f /etc/rabbitmq/rabbitmq-env.conf \
+   && as_root grep -qs '^PLUGINS_DIR="/usr/lib/rabbitmq/plugins:/usr/lib/rabbitmq/lib/rabbitmq_server-' /etc/rabbitmq/rabbitmq-env.conf; then
+  as_root sed -i '\|^PLUGINS_DIR="/usr/lib/rabbitmq/plugins:/usr/lib/rabbitmq/lib/rabbitmq_server-[^"]*/plugins"$|d' /etc/rabbitmq/rabbitmq-env.conf \
+    || die "could not remove the stale PLUGINS_DIR line from /etc/rabbitmq/rabbitmq-env.conf"
+  fixed "removed a stale pinned PLUGINS_DIR from /etc/rabbitmq/rabbitmq-env.conf"
+fi
 as_root rabbitmq-plugins enable --offline rabbitmq_mqtt rabbitmq_auth_backend_http >/dev/null \
   || die "rabbitmq-plugins could not enable rabbitmq_mqtt / rabbitmq_auth_backend_http (output above)."
 want="$(mktemp)"
