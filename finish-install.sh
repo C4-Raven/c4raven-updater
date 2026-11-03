@@ -119,7 +119,7 @@ if [[ "$BACKEND" == source ]]; then
   if ! as_app test -x "$VENV/bin/raven" || ! as_app "$PY" -c 'import raven.app' >/dev/null 2>&1; then
     as_app_sh "poetry config virtualenvs.in-project true"
     [[ "$DISTRO_FAMILY" == rhel ]] && as_app_sh "cd $(q "$WORKDIR") && poetry env use \$(command -v python3.12)"
-    retry as_app_sh "cd $(q "$WORKDIR") && poetry install --no-interaction" || die "poetry install failed (output above)."
+    retry as_app_sh "cd $(q "$WORKDIR") && PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring poetry install --no-interaction" || die "poetry install failed (output above)."
     as_app git -C "$WORKDIR" checkout -- raven/__init__.py 2>/dev/null || true
     fixed "backend dependencies installed"
   else

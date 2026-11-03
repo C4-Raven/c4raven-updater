@@ -274,7 +274,7 @@ if [[ "$SKIP_BACKEND" != 1 ]]; then
         # install.sh built this venv with Poetry; keep following poetry.lock.
         as_app_sh 'command -v poetry' >/dev/null 2>&1 \
             || die "poetry isn't on the $APP_OWNER user's PATH. Run ./finish-install.sh, which reinstalls it."
-        retry as_app_sh "cd $(printf '%q' "$SERVER_SRC_DIR") && poetry install --no-interaction" \
+        retry as_app_sh "cd $(printf '%q' "$SERVER_SRC_DIR") && PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring poetry install --no-interaction" \
             || die "poetry install failed after retries (output above). The services are still running the previous code; fix the error (network, disk space) and re-run."
     else
         retry as_app "$RAVEN_VENV/bin/pip" install -q -e "$SERVER_SRC_DIR" \
