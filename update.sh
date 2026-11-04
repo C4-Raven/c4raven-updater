@@ -29,9 +29,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/common.sh"
 
 # ---- layout -----------------------------------------------------------------
-#   legacy  one login user owns everything: venv ~/.opentakserver_venv, data
-#           ~/ots, source in ~/src, UI in /var/www/html/opentakserver,
-#           opentakserver.service
+#   legacy  one login user owns everything: venv ~/.raven_venv, data
+#           ~/ots, source in ~/src, UI in /var/www/html/raven, raven.service
+#           (the same unit and UI directory names as the raven layout, so
+#           detection keys on the venv in the login user's home only)
 #   raven   c4raven-server-setup's install.sh, online .deb or .rpm: a `raven`
 #           system user owns /opt/raven/{c4raven-server,c4raven-ui,data},
 #           UI in /var/www/html/raven, raven.service
@@ -43,25 +44,25 @@ RAVEN_HOME="${RAVEN_HOME:-/opt/raven}"
 RAVEN_USER="${RAVEN_USER:-raven}"
 
 if [[ "$LAYOUT" == auto ]]; then
-    if [[ -d "$HOME/.opentakserver_venv" ]]; then
+    if [[ -d "$HOME/.raven_venv" ]]; then
         LAYOUT=legacy
     elif as_root test -d "$RAVEN_HOME/c4raven-server/.git"; then
         LAYOUT=raven
     elif as_root test -L "$RAVEN_HOME/venv"; then
         LAYOUT=offline
     else
-        die "No C4 Raven install found (looked for ~/.opentakserver_venv, $RAVEN_HOME/c4raven-server and $RAVEN_HOME/venv). If yours lives elsewhere, set LAYOUT=legacy or LAYOUT=raven plus the paths in README.md."
+        die "No C4 Raven install found (looked for ~/.raven_venv, $RAVEN_HOME/c4raven-server and $RAVEN_HOME/venv). If yours lives elsewhere, set LAYOUT=legacy or LAYOUT=raven plus the paths in README.md."
     fi
 fi
 
 case "$LAYOUT" in
     legacy)
-        RAVEN_VENV="${RAVEN_VENV:-$HOME/.opentakserver_venv}"
+        RAVEN_VENV="${RAVEN_VENV:-$HOME/.raven_venv}"
         RAVEN_DATA_DIR="${RAVEN_DATA_DIR:-$HOME/ots}"
-        RAVEN_SERVICES="${RAVEN_SERVICES:-opentakserver.service eud_handler.service eud_handler_ssl.service cot_parser.service}"
+        RAVEN_SERVICES="${RAVEN_SERVICES:-raven.service eud_handler.service eud_handler_ssl.service cot_parser.service}"
         SERVER_SRC_DIR="${SERVER_SRC_DIR:-$HOME/src/c4raven-server}"
         UI_SRC_DIR="${UI_SRC_DIR:-$HOME/src/c4raven-ui}"
-        UI_DEPLOY_DIR="${UI_DEPLOY_DIR:-/var/www/html/opentakserver}"
+        UI_DEPLOY_DIR="${UI_DEPLOY_DIR:-/var/www/html/raven}"
         HEALTH_URL="${HEALTH_URL:-https://127.0.0.1/api/health}"
         ;;
     raven|offline)
@@ -136,7 +137,6 @@ as_app test -x "$PYTHON" || die "$PYTHON not found -- wrong RAVEN_VENV?"
 # and dies on a log file systemd created as root -- fix that before anything
 # runs it.
 MAIN_LOG=raven.log
-[[ "$LAYOUT" == legacy ]] && MAIN_LOG=opentakserver.log
 fix_log_ownership "$APP_OWNER" "$RAVEN_DATA_DIR/logs" "$MAIN_LOG" || true
 
 # ---- an install that never finished: complete it first ----------------------
@@ -163,6 +163,8 @@ if [[ "$LAYOUT" == offline ]]; then
     log "Offline package install: the code is updated by a newer offline bundle, not from GitHub"
     out=$(config_add_keys "$PYTHON" "$RAVEN_DATA_DIR/config.yml" "$APP_OWNER" "$RAVEN_HOME/.raven-secrets.env") || warn "could not add new settings to config.yml"
     [[ -n "${out:-}" ]] && fixed "config.yml: added $(echo "$out" | tr '\n' ' ')"
+    out=$(config_drop_retired "$PYTHON" "$RAVEN_DATA_DIR/config.yml" "$APP_OWNER") || warn "could not remove retired settings from config.yml"
+    [[ -n "${out:-}" ]] && fixed "config.yml: removed the retired default of $out"
     [[ "$SKIP_NGINX" == 1 ]] || nginx_harden || true
     export RAVEN_USER="$APP_OWNER" RAVEN_HOME RAVEN_DATA_DIR RAVEN_VENV
     fedhub_section offline
@@ -339,6 +341,11 @@ if out=$(config_add_keys "$PYTHON" "$RAVEN_DATA_DIR/config.yml" "$APP_OWNER" "$R
 else
     warn "could not add new settings to config.yml (above); the built-in defaults apply"
 fi
+if out=$(config_drop_retired "$PYTHON" "$RAVEN_DATA_DIR/config.yml" "$APP_OWNER"); then
+    [[ -n "$out" ]] && fixed "config.yml: removed the retired default of $out"
+else
+    warn "could not remove retired settings from config.yml (above)"
+fi
 # MediaMTX's webhook token: a mediamtx.yml still holding the placeholder
 # makes every stream's auth callback fail.
 MTX_YML="$RAVEN_DATA_DIR/mediamtx/mediamtx.yml"
@@ -436,7 +443,7 @@ fi
 # Never fails the update. Legacy layout: check only (its Federation Hub was set
 # up by hand and is left exactly as it is).
 if [[ "$LAYOUT" == legacy ]]; then
-    export RAVEN_USER="$APP_OWNER" RAVEN_DATA_DIR RAVEN_VENV RAVEN_SECRETS_FILE="" RAVEN_MAIN_UNIT=opentakserver
+    export RAVEN_USER="$APP_OWNER" RAVEN_DATA_DIR RAVEN_VENV RAVEN_SECRETS_FILE="" RAVEN_MAIN_UNIT=raven
 else
     export RAVEN_USER="$APP_OWNER" RAVEN_HOME RAVEN_DATA_DIR RAVEN_VENV
 fi

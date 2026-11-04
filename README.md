@@ -9,11 +9,8 @@ Deploys the latest [c4raven-server](https://github.com/C4-Raven/c4raven-server)
 (frontend) to an existing install, in one command, without losing your
 data.
 
-Both are our own git forks, not upstream packages — "update" means
-*pull our fork's latest commits and redeploy them*, not "pull in
-whatever changed upstream." See
-[Pulling in upstream changes](#pulling-in-upstream-changes) below for
-that separate, deliberate task.
+"Update" means *pull the latest commits of those two repositories and
+redeploy them*.
 
 ## What this does
 
@@ -74,14 +71,16 @@ It works on every install type and picks the right one by itself:
 | | Legacy | `raven` (install.sh / online `.deb` / `.rpm`) | Offline `.deb` / `.rpm` |
 |---|---|---|---|
 | Owner | your login user | the `raven` system user | the `raven` system user |
-| Backend | `~/src/c4raven-server`, venv `~/.opentakserver_venv` | `/opt/raven/c4raven-server` (Poetry venv in `.venv`) | `/opt/raven/venv` (no source checkout) |
+| Backend | `~/src/c4raven-server`, venv `~/.raven_venv` | `/opt/raven/c4raven-server` (Poetry venv in `.venv`) | `/opt/raven/venv` (no source checkout) |
 | Data | `~/ots` | `/opt/raven/data` | `/opt/raven/data` |
-| UI served from | `/var/www/html/opentakserver` | `/var/www/html/raven` | `/var/www/html/raven` |
-| Services | `opentakserver`, `eud_handler`, `eud_handler_ssl`, `cot_parser` | `raven`, `eud_handler`, `eud_handler_ssl`, `cot_parser`, `mediamtx` (+ `federation-hub` if running) | same as `raven` |
+| UI served from | `/var/www/html/raven` | `/var/www/html/raven` | `/var/www/html/raven` |
+| Services | `raven`, `eud_handler`, `eud_handler_ssl`, `cot_parser` | `raven`, `eud_handler`, `eud_handler_ssl`, `cot_parser`, `mediamtx` (+ `federation-hub` if running) | same as `raven` |
 
-Detection order: legacy when `~/.opentakserver_venv` exists, then `raven`
-when `/opt/raven/c4raven-server` is a git checkout, then offline when
-`/opt/raven/venv` is a symlink. On the `raven` layout every git, Poetry,
+Detection order: legacy when `~/.raven_venv` exists in the home of the
+user running it, then `raven` when `/opt/raven/c4raven-server` is a git
+checkout, then offline when `/opt/raven/venv` is a symlink. The unit
+name and UI directory are the same on every layout, so they play no part
+in detection. On the `raven` layout every git, Poetry,
 yarn and flask step runs as the `raven` user, so file ownership stays the
 way the installer left it. A packaged install that sits on a detached
 commit is moved onto `main` when that loses nothing.
@@ -156,12 +155,12 @@ shown as legacy / `raven`:
 | `LAYOUT`          | `auto`                          | `legacy`, `raven` or `offline` to skip detection  |
 | `RAVEN_HOME`      | `/opt/raven`                    | Root of the `raven` layout                         |
 | `RAVEN_USER`      | `raven`                         | Account that owns the `raven` layout               |
-| `RAVEN_VENV`      | `~/.opentakserver_venv` / `/opt/raven/c4raven-server/.venv` | Python virtualenv the backend runs from |
+| `RAVEN_VENV`      | `~/.raven_venv` / `/opt/raven/c4raven-server/.venv` | Python virtualenv the backend runs from |
 | `RAVEN_DATA_DIR`  | `~/ots` / `/opt/raven/data`     | Data dir (`config.yml`, certs, uploads, ...)       |
 | `RAVEN_SERVICES`  | see the table above             | Space-separated systemd units to restart           |
 | `SERVER_SRC_DIR`  | `~/src/c4raven-server` / `/opt/raven/c4raven-server` | Backend source checkout |
 | `UI_SRC_DIR`      | `~/src/c4raven-ui` / `/opt/raven/c4raven-ui` | Where the frontend source is cloned/built |
-| `UI_DEPLOY_DIR`   | `/var/www/html/opentakserver` / `/var/www/html/raven` | Where the built frontend is served from |
+| `UI_DEPLOY_DIR`   | `/var/www/html/raven` (all layouts) | Where the built frontend is served from |
 | `SERVER_BRANCH`, `UI_BRANCH` | `main`               | Branch to fast-forward to                          |
 | `BACKUP_ROOT`     | `~/backups`                     | Where timestamped backups are written              |
 | `SERVER_REPO`, `UI_REPO` | the C4-Raven GitHub repos | Cloned only if the checkout doesn't exist yet      |
@@ -358,6 +357,10 @@ It never drops the database, never regenerates an existing CA or
 from `SETUP_REPO_RAW` (default: c4raven-server-setup's `master` on GitHub;
 `file:///path/to/c4raven-server-setup` uses a local checkout).
 
+On a legacy box (`~/.raven_venv` and nothing under `/opt/raven`) it
+refuses to run: that layout shares `raven.service` and
+`/var/www/html/raven` with this one but is updated by `update.sh`.
+
 ## Login problems
 
 `./diagnose-login.sh` (on the `raven` layout) checks why the web UI won't
@@ -408,9 +411,9 @@ Restore the database **and** the code together. The old code can't run
 against the migrated schema, and the new code migrates an old database
 forward again as soon as it starts. Legacy layout: use
 `git -C ~/src/c4raven-server checkout <commit>` with
-`~/.opentakserver_venv/bin/pip install -e ~/src/c4raven-server`, the `ots`
-database, `~/ots`, `/var/www/html/opentakserver` and `opentakserver` in
-place of `raven`. The nginx fixes have their own per-file copies in
+`~/.raven_venv/bin/pip install -e ~/src/c4raven-server`, the `ots`
+database and `~/ots` in place of `raven` (the UI directory and the
+service names are the same as on the `raven` layout). The nginx fixes have their own per-file copies in
 `/etc/nginx/raven-backups/<time>/`.
 
 ## Testing
@@ -426,42 +429,3 @@ repo's harness), then runs four scenarios:
 
 CI (`.github/workflows/test.yml`) runs shellcheck on every push and runs
 the scenarios on both distros for `master`.
-
-## Pulling in upstream changes
-
-This is a separate, occasional maintenance task — not something
-`update.sh` does automatically, and not something to run directly
-against production. `c4raven-server` carries a full package rename
-(`opentakserver` → `raven`) on top of upstream, so a merge touches
-nearly every file upstream has changed and *will* produce real
-conflicts most of the time. Do this in a dev checkout, not on the live
-server:
-
-```
-cd ~/src/c4raven-server        # or a separate clone, off production
-git remote add upstream https://github.com/brian7704/OpenTAKServer.git   # if not already present
-git fetch upstream
-git merge upstream/master
-# resolve conflicts -- expect them in most files upstream touched,
-# since our identifiers no longer match upstream's
-```
-
-Watch in particular for:
-- Any file upstream added that references `opentakserver.*` internally
-  — needs the same rename treatment as the rest of the codebase.
-- New `OTS_*` config keys — need a `RAVEN_*` counterpart in
-  `raven/defaultconfig.py` (which is what `flask raven generate-config`
-  and the app's startup defaults are built from) and, if you override
-  them, in your own `config.yml`.
-- New references to the server's own operational certificate, the
-  plugin entry-point group, or anything else that has to match real
-  external state rather than just our naming — these need to keep
-  pointing at the real, already-deployed paths (`certs/raven/`, the
-  `raven.plugin` entry-point group) rather than being renamed to match
-  whatever upstream calls them, since renaming them for real means
-  coordinating actual files already on the live server, not just a
-  text substitution.
-
-Test it (`create_app()` should import and boot cleanly, ideally against
-a copy of a real `config.yml`), then push to `origin/main`. Only then
-does a normal `./update.sh` run pick it up.

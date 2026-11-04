@@ -71,6 +71,22 @@ fetch() {  # fetch RELPATH DEST  (from the setup repo, with retries)
 
 systemd_notice
 
+# The legacy layout (one login user, venv ~/.raven_venv) uses the same
+# raven.service and /var/www/html/raven as this one, but nothing under
+# $APP_HOME: it is updated by update.sh and must not be "finished" into a
+# second install.
+INVOKER_HOME="$HOME"
+[[ -n "${SUDO_USER:-}" ]] && INVOKER_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+# Also ask systemd: an existing raven.service that runs from a ~/.raven_venv
+# is the legacy layout whoever runs this (root without SUDO_USER, another
+# sudo user).
+MAIN_EXEC=""
+command -v systemctl >/dev/null 2>&1 && MAIN_EXEC=$(systemctl show -p ExecStart --value raven.service 2>/dev/null || true)
+if { [[ -d "$INVOKER_HOME/.raven_venv" ]] || [[ "$MAIN_EXEC" == *"/.raven_venv/"* ]]; } \
+   && ! as_root test -d "$APP_HOME/c4raven-server/.git" && ! as_root test -L "$APP_HOME/venv"; then
+  die "This is the legacy layout (a ~/.raven_venv install), not an install under $APP_HOME. Use ./update.sh instead."
+fi
+
 # Which backend layout: install.sh / online package = Poetry venv in the
 # checkout; offline package = plain venv behind /opt/raven/venv.
 if as_root test -L "$APP_HOME/venv"; then
@@ -193,6 +209,9 @@ db_migrate "$APP_USER" "$VENV" "$DATA_DIR" "$WORKDIR" || die "Migrations failed 
 log "config.yml settings"
 if out=$(config_add_keys "$PY" "$CFG" "$APP_USER" "$APP_HOME/.raven-secrets.env"); then
   if [[ -n "$out" ]]; then fixed "config.yml: added $(echo "$out" | tr '\n' ' ')"; else ok "config.yml left as it is"; fi
+fi
+if out=$(config_drop_retired "$PY" "$CFG" "$APP_USER"); then
+  [[ -n "$out" ]] && fixed "config.yml: removed the retired default of $out"
 fi
 
 # ---- 3. certificate authority ----------------------------------------------------------

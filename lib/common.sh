@@ -176,6 +176,55 @@ svc() {
 # NOT what existing installs should get.
 NEW_CONFIG_KEYS=""
 
+# Retired values to drop from an existing config.yml, one per line:
+# KEY<TAB>sha256 of the exact old value. The server writes every default into
+# config.yml on first start, so a default that was later changed survives on
+# older servers and overrides the new one. Matching on the hash removes only
+# the untouched old default, never a value an admin chose.
+#   RAVEN_PLUGIN_REPO: the old third-party plugin index (now no default).
+RETIRED_CONFIG_VALUES="RAVEN_PLUGIN_REPO	81627cda4fbf7b3a7ae0940f500a34890df746e170fa2e91923744af06734332"
+
+# config_drop_retired PYTHON CONFIG OWNER -- remove the top-level lines of
+# config.yml whose key and value match RETIRED_CONFIG_VALUES (backup first).
+# Prints the removed keys.
+config_drop_retired() {
+  local py=$1 cfg=$2 owner=$3
+  [ -n "$RETIRED_CONFIG_VALUES" ] || return 0
+  as_user "$owner" "$py" - "$cfg" "$RETIRED_CONFIG_VALUES" <<'PY'
+import hashlib, os, re, shutil, sys, time, yaml
+path, spec = sys.argv[1], sys.argv[2]
+retired = dict(line.split("\t", 1) for line in spec.splitlines() if line.strip())
+with open(path) as f:
+    lines = f.readlines()
+keep, dropped = [], []
+for line in lines:
+    m = re.match(r"^([A-Za-z0-9_]+):(.*)$", line.rstrip("\n"))
+    if m and m.group(1) in retired:
+        try:
+            value = yaml.safe_load(m.group(2))
+        except yaml.YAMLError:
+            value = None
+        if isinstance(value, str) and hashlib.sha256(value.encode()).hexdigest() == retired[m.group(1)]:
+            dropped.append(m.group(1))
+            continue
+    keep.append(line)
+if not dropped:
+    sys.exit(0)
+before = yaml.safe_load("".join(lines)) or {}
+after_text = "".join(keep)
+after = yaml.safe_load(after_text) or {}
+if {k: v for k, v in before.items() if k not in dropped} != after:
+    sys.exit("config.yml did not re-parse the same after the edit; left unchanged")
+shutil.copy2(path, f"{path}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+tmp = f"{path}.tmp-{os.getpid()}"
+with open(tmp, "w") as f:
+    f.write(after_text)
+shutil.copymode(path, tmp)
+os.replace(tmp, path)
+print(" ".join(dropped))
+PY
+}
+
 # config_add_keys PYTHON CONFIG_FILE OWNER [ENV_FILE]
 # Appends only the missing keys, as text, so admins' formatting and comments
 # survive; then re-parses the file and leaves it untouched if that fails.

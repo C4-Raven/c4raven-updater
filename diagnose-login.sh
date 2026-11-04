@@ -184,7 +184,7 @@ done
 # is. -R dereferences them. Same below.
 DOMAIN=""
 if [[ ${#NGINX_DIRS[@]} -gt 0 ]]; then
-  DOMAIN=$(sudo grep -RhoE 'server_name\s+[^;]+' "${NGINX_DIRS[@]}" 2>/dev/null | awk '{for(i=2;i<=NF;i++) print $i}' | grep -vE '^(_|raven_[0-9]+|opentakserver_[0-9]+|localhost)$' | grep '\.' | head -1)
+  DOMAIN=$(sudo grep -RhoE 'server_name\s+[^;]+' "${NGINX_DIRS[@]}" 2>/dev/null | awk '{for(i=2;i<=NF;i++) print $i}' | grep -vE '^(_|raven_[0-9]+|localhost)$' | grep '\.' | head -1)
 fi
 h "Login test: through nginx on 443 (as ${DOMAIN:-the server IP})"
 login_test "https://127.0.0.1" "${DOMAIN:-}"
