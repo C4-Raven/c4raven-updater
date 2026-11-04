@@ -338,13 +338,29 @@ fh_deb_real_unit() {
 # supervised: bash waits for the FIRST of the four parts to exit (wait -n)
 # and then fails, so systemd stops the other three and restarts all four
 # (Restart=on-failure); with a plain `wait` plus RemainAfterExit=yes a dead
-# hub stayed "active". A unit that is already there is left alone.
+# hub stayed "active" and a killed one stayed down until started by hand.
+# That older unit (the one 04-finish-and-start.sh used to write) is upgraded
+# in place, the old file kept beside it; any other existing unit is left alone.
+
+# fh_deb_unit_outdated -- 0 if $SYSTEMD_DIR/federation-hub.service is the old
+# unsupervised unit: it runs the four hub scripts but has no Restart= line.
+fh_deb_unit_outdated() {
+  local u="$SYSTEMD_DIR/federation-hub.service"
+  as_root test -f "$u" || return 1
+  as_root grep -q 'federation-hub-broker\.sh' "$u" || return 1
+  ! as_root grep -q '^Restart=' "$u"
+}
+
 fh_deb_unit() {
-  if fh_deb_real_unit; then
+  local u="$SYSTEMD_DIR/federation-hub.service" bak=""
+  if fh_deb_unit_outdated; then
+    bak="$u.bak-$(date +%Y%m%d-%H%M%S)"
+    as_root cp -p "$u" "$bak" || die "could not back up $u"
+  elif fh_deb_real_unit; then
     ok "federation-hub.service present"
     return 0
   fi
-  fh_install_file 644 "$FH_ROOT_OWNER" "$SYSTEMD_DIR/federation-hub.service" <<EOF || true
+  fh_install_file 644 "$FH_ROOT_OWNER" "$u" <<EOF || true
 [Unit]
 Description=Federation Hub Service
 After=network.target mongod.service
@@ -365,6 +381,12 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
   [ "$HAS_SYSTEMD" = 1 ] && as_root systemctl daemon-reload
+  if [ -n "$bak" ]; then
+    # No restart just for this: the running hub carries on, and the new unit
+    # applies from its next start (systemd itself restarts it from then on).
+    fixed "upgraded federation-hub.service so systemd restarts the hub if it dies (takes effect at its next restart; old unit kept as $bak)"
+    return 0
+  fi
   FH_CHANGED=1; fixed "wrote federation-hub.service"
 }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs TAK Federation Hub next to C4 Raven and connects Raven to it.
 #
-#   ./install-fedhub.sh [--artifact PATH] [--deb PATH] [--host NAME] [--yes] [--check]
+#   ./install-fedhub.sh [--artifact PATH] [--deb PATH] [--host NAME] [--yes] [--check] [--repair-unit]
 #
 # Federation Hub is licensed: download it from tak.gov first, as either
 #   takserver-fed-hub_<ver>_all.deb          (Debian / Ubuntu)
@@ -17,7 +17,13 @@
 #                    4 installed but Raven not connected (or the hub's CA is
 #                    not a CA group in the active federation policy).
 #                    It takes no lock (safe while update.sh runs) and ignores
-#                    the skip variables below.
+#                    the skip variables below. An existing .deb install
+#                    whose federation-hub.service never restarts the hub is
+#                    noted (the exit code is unchanged).
+#   --repair-unit    only upgrade that old federation-hub.service so systemd
+#                    restarts the hub when it dies (.deb installs; a backup of
+#                    the old unit is kept). Nothing else is changed, so it is
+#                    safe on any layout; it applies from the hub's next restart.
 #
 # Host: --host NAME (changes the host), else the host used last time, else
 # RAVEN_DOMAIN, else the domain install.sh recorded, else asked.
@@ -40,12 +46,13 @@ set -euo pipefail
 # RAVEN_FEDHUB_ARTIFACT set but empty (non-empty = install that file); else,
 # RAVEN_FEDHUB_ARTIFACT unset, RAVEN_FEDHUB_DEB set but empty. An explicit
 # --artifact/--deb argument overrides the empty variables (not SKIP=1).
-# --check only reports, so it is never skipped.
+# --check only reports and --repair-unit only fixes the unit, so neither is
+# ever skipped.
 fh_early_skip() {
   local a has_check=0 has_artifact=0 why=""
   for a in "$@"; do
     case "$a" in
-      --check) has_check=1 ;;
+      --check|--repair-unit) has_check=1 ;;
       --artifact|--artifact=*|--deb|--deb=*) has_artifact=1 ;;
     esac
   done
@@ -87,6 +94,7 @@ fh_parse_args() {
   FH_HOST_ARG=""
   FH_YES=0
   FH_CHECK=0
+  FH_REPAIR_UNIT=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --artifact|--deb) [ "$#" -ge 2 ] || die "$1 needs a path"; FH_ARTIFACT_ARG=$2; shift 2 ;;
@@ -95,6 +103,7 @@ fh_parse_args() {
       --host=*) FH_HOST_ARG=${1#*=}; shift ;;
       --yes|-y) FH_YES=1; shift ;;
       --check) FH_CHECK=1; shift ;;
+      --repair-unit) FH_REPAIR_UNIT=1; shift ;;
       -h|--help) fh_usage; exit 0 ;;
       *) die "unknown argument: $1 (see --help)" ;;
     esac
@@ -143,6 +152,7 @@ fh_detect() {
 fh_check() {
   local problems
   fh_detect
+  fh_unit_note
   if [ "$FH_INSTALLED" != 1 ]; then
     if [ -n "$FH_MODE" ]; then
       echo "Federation Hub: not installed (a $FH_MODE install is incomplete; run $FH_SELF to finish it)"
@@ -157,6 +167,28 @@ fh_check() {
   fi
   echo "Federation Hub: installed ($FH_MODE ${FH_VERSION:-?}), Raven not connected: $problems"
   return 4
+}
+
+# fh_unit_note -- one line when the .deb hub's unit is the old one that never
+# restarts it (stdout, so update.sh / finish-install.sh show it too).
+fh_unit_note() {
+  if [ "$FH_MODE" = deb ] && fh_deb_unit_outdated; then
+    echo "Note: federation-hub.service does not restart Federation Hub if it dies; fix with: $FH_SELF --repair-unit"
+  fi
+  return 0
+}
+
+# fh_repair_unit -- --repair-unit: upgrade the old unit and nothing else.
+fh_repair_unit() {
+  fh_detect
+  [ "$FH_MODE" = deb ] || die "--repair-unit is for .deb installs of Federation Hub (the Docker release's containers already restart themselves)."
+  log "Federation Hub service unit"
+  if fh_deb_unit_outdated; then
+    fh_deb_unit
+  else
+    ok "federation-hub.service already restarts the hub (or is not the old unit); nothing to do"
+  fi
+  print_summary
 }
 
 fh_summary() {
@@ -207,6 +239,10 @@ fh_main() {
     exit "$rc"
   fi
   fh_lock
+  if [ "$FH_REPAIR_UNIT" = 1 ]; then
+    fh_repair_unit
+    exit 0
+  fi
   [ "$(id -un)" != "$APP_USER" ] || [ "$IS_ROOT" = 1 ] || [ "$APP_USER" = "$FEDHUB_TAK_USER" ] \
     || die "Run this as your own sudo-capable user (or root), not as '$APP_USER'."
   systemd_notice

@@ -539,6 +539,68 @@ test_deb_dead_hub_restarted() {
   check "  ... journal shown" grep -q 'journalctl -u federation-hub' "$L/journalctl"
 }
 
+# The unit 04-finish-and-start.sh used to write: plain `wait`, RemainAfterExit,
+# no Restart= -- a killed hub stays down.
+write_old_unit() {
+  cat > "$SYSTEMD_DIR/federation-hub.service" <<EOF
+[Unit]
+Description=Federation Hub Service
+After=network.target mongod.service
+Requires=mongod.service
+
+[Service]
+Type=simple
+WorkingDirectory=$FEDHUB_ROOT/scripts
+ExecStart=/bin/bash -c "./federation-hub-policy.sh & ./federation-hub-plugin-manager.sh & ./federation-hub-ui.sh & ./federation-hub-broker.sh & wait"
+RemainAfterExit=yes
+User=$ME
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+test_deb_old_unit_upgraded() {
+  deb_install; expect_rc 0 "install"
+  local u=$SYSTEMD_DIR/federation-hub.service
+  write_old_unit
+  run_fh --check
+  check "--check notes the old unit" has "does not restart Federation Hub if it dies"
+  check "  ... and names --repair-unit" has "--repair-unit"
+  local rc_check=$RC
+  : > "$L/restarts"
+  RAVEN_FEDHUB_SKIP=1 run_fh --repair-unit; expect_rc 0 "--repair-unit (even with RAVEN_FEDHUB_SKIP=1)"
+  check "  ... Restart=on-failure now" grep -qx "Restart=on-failure" "$u"
+  check "  ... supervised wait -n" grep -q "& wait -n; exit 1\"$" "$u"
+  check "  ... no RemainAfterExit" bash -c '! grep -q RemainAfterExit "$1"' _ "$u"
+  check "  ... old unit backed up" bash -c 'ls "$1".bak-* >/dev/null 2>&1 && grep -q RemainAfterExit "$1".bak-*' _ "$u"
+  check "  ... hub not restarted" bash -c '! grep -q federation-hub "$1"' _ "$L/restarts"
+  check "  ... reported" has "upgraded federation-hub.service"
+  run_fh --check
+  check "--check: no note any more" lacks "does not restart Federation Hub"
+  check "  ... same exit code as before" test "$RC" = "$rc_check"
+  run_fh --repair-unit; expect_rc 0 "--repair-unit again"
+  check "  ... nothing to do" has "nothing to do"
+  check "  ... one backup only" test "$(ls "$u".bak-* | wc -l)" = 1
+  write_old_unit; rm -f "$u".bak-*
+  deb_install; expect_rc 0 "a full re-run"
+  check "  ... also upgrades the old unit" grep -qx "Restart=on-failure" "$u"
+}
+
+test_deb_custom_unit_kept() {
+  deb_install; expect_rc 0 "install"
+  local u=$SYSTEMD_DIR/federation-hub.service
+  write_old_unit; printf 'Restart=always\n' >> "$u"
+  cp "$u" "$T/custom"
+  run_fh --repair-unit; expect_rc 0 "--repair-unit on a unit that already has Restart="
+  check "  ... left exactly as it was" cmp -s "$u" "$T/custom"
+}
+
+test_repair_unit_needs_deb() {
+  run_fh --repair-unit; expect_rc 1 "--repair-unit with no .deb install"
+  check "  ... says it is for .deb installs" has "for .deb installs"
+}
+
 t docker_other_version   test_docker_other_version_refused
 t docker_upgrade         test_docker_upgrade_carries_state
 t docker_reinstall       test_docker_reinstall_reuses_db_password
@@ -557,6 +619,9 @@ t deb_mongosh_required   test_deb_mongosh_required
 t deb_generator_unit     test_deb_generator_unit
 t deb_mongod_enabled     test_deb_mongod_enabled
 t deb_dead_hub           test_deb_dead_hub_restarted
+t deb_old_unit           test_deb_old_unit_upgraded
+t deb_custom_unit        test_deb_custom_unit_kept
+t repair_unit_no_deb     test_repair_unit_needs_deb
 
 echo
 pass=$(grep -c '^PASS' "$RESULTS"); fail=$(grep -c '^FAIL' "$RESULTS")

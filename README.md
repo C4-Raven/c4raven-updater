@@ -295,6 +295,25 @@ why). `update.sh` and `finish-install.sh` run the same check at the end:
 they offer to install a missing hub when run from a terminal, and
 reconnect Raven when needed. On the `legacy` layout they only report.
 
+### If the hub stays down after a crash
+
+Federation Hub `.deb` installs made before this installer existed (with
+`federation-hub-setup`'s `04-finish-and-start.sh`) have a
+`federation-hub.service` that never restarts the hub. If one of its
+processes dies or is killed, the service shows `failed` and stays down until
+someone starts it. `--check` then prints a note saying so. Fix it with:
+
+```
+./install-fedhub.sh --repair-unit
+sudo systemctl start federation-hub    # only if it is down right now
+```
+
+`--repair-unit` only rewrites that unit (the old one is kept as
+`federation-hub.service.bak-<date>`), so it is safe on any layout,
+including `legacy`. It does not restart a running hub; the new unit applies
+from its next restart, and from then on systemd restarts the hub itself if
+it dies. A full `./install-fedhub.sh` run upgrades the unit too.
+
 ### If it did not install
 
 | What you see | Why, and what to do |
