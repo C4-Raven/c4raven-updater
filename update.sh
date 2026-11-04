@@ -357,6 +357,15 @@ if as_root test -f "$MTX_YML" && as_root grep -q MTX_TOKEN "$MTX_YML"; then
     fi
 fi
 
+# fedhub_bridge.service is PartOf=raven.service, so restarting raven stops it,
+# but nothing in raven.service starts it again: without it in this list an
+# update leaves federation silently down. Only an enabled unit is added, so an
+# admin who disabled the bridge keeps it off.
+if unit_exists fedhub_bridge && [[ " $RAVEN_SERVICES " != *" fedhub_bridge.service "* ]] \
+   && { [[ "$HAS_SYSTEMD" != 1 ]] || systemctl is-enabled --quiet fedhub_bridge 2>/dev/null; }; then
+    RAVEN_SERVICES="$RAVEN_SERVICES fedhub_bridge.service"
+fi
+
 # ---- database --------------------------------------------------------------------
 MAIN_SERVICE="${RAVEN_SERVICES%% *}"
 # Units that run backend code: stop them so nothing queries a half-migrated
