@@ -125,6 +125,14 @@ cd c4raven-updater
 Run it as your own sudo-capable user (not `raven`), or as root, e.g. inside
 a container. It needs network access to GitHub and the npm/PyPI registries.
 
+`update.sh` does not update itself. If you cloned c4raven-updater before,
+pull it first, or you run the old scripts and miss newer steps (such as
+Federation Hub):
+
+```
+cd ~/c4raven-updater && git pull --ff-only && ./update.sh
+```
+
 ### Docker
 
 Both scripts work in a container whose PID 1 is systemd, such as
@@ -170,6 +178,137 @@ Example:
 ```
 RAVEN_DATA_DIR=/opt/ots ./update.sh
 ```
+
+## Federation Hub
+
+TAK Federation Hub connects this Raven server to other TAK servers.
+`./install-fedhub.sh` installs it and connects Raven to it. `install.sh`,
+`update.sh` and `finish-install.sh` all run it for you when Federation Hub
+is missing. You can also run it on its own at any time.
+
+### 1. Download Federation Hub from TAK.gov
+
+It is licensed, so nothing here can download it for you. Get one of these
+from your TAK.gov account:
+
+| File | Use it on |
+|------|-----------|
+| `takserver-fed-hub_<version>_all.deb` | Ubuntu / Debian (preferred there) |
+| the Federation Hub Docker release, a `.zip` with `fed`, `hub` and `docker` in its name | Ubuntu / Debian, or Rocky / Alma / RHEL 9 |
+
+Copy it to the Raven server, into `~/Downloads` of the user you will run
+the installer as (a subfolder is fine). It is then found without you
+typing the path.
+
+Not supported: the `.deb` on Debian 13 (it needs OpenJDK 17, which Debian
+13 does not ship; use the Docker `.zip`), Debian on ARM (MongoDB only
+publishes amd64 packages for Debian), and Docker installed as a snap.
+
+### 2. Run the installer
+
+As your normal sudo-capable user, **not** root and **not** `raven`:
+
+```
+cd ~/c4raven-updater && git pull --ff-only    # always get the current scripts first
+./install-fedhub.sh                            # finds the file in ~/Downloads
+./install-fedhub.sh --artifact /path/to/takserver-fed-hub_5.8-RELEASE92_all.deb   # or name it yourself
+```
+
+### 3. Answer its questions
+
+At most three, and only the first time:
+
+| Question | What to answer |
+|----------|----------------|
+| `Found a Federation Hub release: ... Use it? [Y/n]` | Enter, if that is the file you want. |
+| `Path to the Federation Hub .deb or Docker .zip (Enter to skip, 'never' to stop asking)` | Shown only when no file was found. Give the full path. Enter skips Federation Hub for now. `never` stops `update.sh` and `finish-install.sh` offering it again. |
+| `Host name or IP clients and Raven will use for Federation Hub [192.168.x.x]` | See below. |
+
+**The host question.** The hub's server certificate is issued for exactly
+one name. Raven and every partner TAK server must connect using that exact
+name, or the connection fails its certificate check. It is only asked when
+Raven was installed without a domain name; otherwise the domain is used.
+
+- **Partners only on your own network, or no domain name:** press Enter to
+  accept the address shown, which is this server's LAN IP. Make sure that
+  IP will not change: give the server a static IP or a DHCP reservation.
+- **Partners connect over the internet:** type the public DNS name that
+  points at this server, e.g. `tak.example.org`. A private address such as
+  `192.168.x.x` is not reachable from outside.
+
+The answer is remembered, so later runs (and `install.sh`, `update.sh`)
+keep it. To change it later, run `./install-fedhub.sh --host NEW_NAME`.
+That issues a new certificate, and every server that connects has to
+switch to the new name.
+
+### 4. What it does
+
+Every step checks first and only does what is missing:
+
+- MongoDB (Federation Hub's database), with a password-protected user
+- Federation Hub itself, from the `.deb` (a systemd service) or the Docker
+  release (two containers)
+- its CA and certificates: the server certificate for your host, an admin
+  certificate, and the certificate Raven connects with
+- the hub's own CA added to the active federation policy (without this the
+  hub refuses Raven's connection)
+- firewall ports 9100-9102/tcp, if ufw or firewalld is on
+- Raven's side: the `RAVEN_FEDHUB_*` settings in `config.yml`, a copy of
+  the certificates in the data directory, and `fedhub_bridge.service`
+
+### 5. When it finishes
+
+It prints a summary like this:
+
+```
+  Mode:            deb (version 5.8-RELEASE92)
+  Host:            192.168.0.37  (the server certificate is issued for this name)
+  Admin console:   https://192.168.0.37:9100  (log in with the fedhub-admin.p12 client certificate)
+  Admin cert:      .../fedhub-admin.p12  (copy it off securely: it holds a private key)
+  Passwords:       .../.fedhub-cert-passwords
+```
+
+- **Admin console:** import `fedhub-admin.p12` into your browser's
+  certificates (its password is the `PASS=` line in the passwords file:
+  `sudo cat` the path shown), then open `https://HOST:9100`. Raven admins
+  can also download the `.p12` and its password from Raven's Federation
+  Hub page, after a 2FA check.
+- Raven creates the federation group (`Fed group`) and the `Server` user
+  on its own. You do not need to make them.
+- To federate with another TAK server, exchange CA certificates with it
+  and add its CA as a group in the hub's policy (admin console, or Raven's
+  CA Groups tab).
+
+If the summary says **"Raven is NOT fully connected"**, it lists what is
+wrong. Fix that, or just run `./install-fedhub.sh` again: it is safe to
+re-run.
+
+### Checking it later
+
+```
+./install-fedhub.sh --check
+```
+
+This changes nothing. Exit code 0 means installed and connected to Raven,
+3 not installed, and 4 installed but Raven not connected (the output says
+why). `update.sh` and `finish-install.sh` run the same check at the end:
+they offer to install a missing hub when run from a terminal, and
+reconnect Raven when needed. On the `legacy` layout they only report.
+
+### If it did not install
+
+| What you see | Why, and what to do |
+|--------------|---------------------|
+| Nothing about Federation Hub at all | Your `~/c4raven-updater` is older than the Federation Hub support. Run `git pull --ff-only` in it, then `./install-fedhub.sh`. |
+| `Federation Hub: skipped.` | No file was found and Enter was pressed at the path question. Put the file in `~/Downloads`, or pass `--artifact PATH`. |
+| `no release found in ~/Downloads and no terminal to ask` | It ran without a terminal (e.g. `ssh host ./update.sh`). Run `./install-fedhub.sh --artifact PATH` yourself. |
+| `you chose 'never' earlier` | Run `./install-fedhub.sh --artifact PATH`; that clears the answer. |
+| `Run this as your own sudo-capable user` | You ran it as `raven`. Log in as your normal user. |
+| An error, then exit 1 | Fix what it names and run the same command again. It picks up where it stopped. |
+
+Unattended: `RAVEN_FEDHUB_ARTIFACT=/path/to/file` (or `--artifact`) plus
+`--yes` never asks. `--host NAME` answers the host question.
+`RAVEN_FEDHUB_SKIP=1` skips Federation Hub everywhere.
 
 ## Finishing a half-done install
 
